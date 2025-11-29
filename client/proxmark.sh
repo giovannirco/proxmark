@@ -521,6 +521,105 @@ check_proxmox() {
   fi
 }
 
+discover_storage_paths() {
+  # Discover all available storage paths for benchmarking
+  DISCOVERED_STORAGE=()
+  
+  # Add current disk path first
+  DISCOVERED_STORAGE+=("$DISK_PATH")
+  
+  # Proxmox storage pools
+  if command -v pvesm >/dev/null 2>&1; then
+    while IFS= read -r line; do
+      local name=$(echo "$line" | awk '{print $1}')
+      local type=$(echo "$line" | awk '{print $2}')
+      local status=$(echo "$line" | awk '{print $3}')
+      
+      [[ "$status" != "active" ]] && continue
+      
+      # Get path for this storage
+      local path=""
+      case "$type" in
+        dir|nfs|cifs|glusterfs)
+          path=$(pvesm path "$name" 2>/dev/null | head -1 | sed 's|/images$||' || echo "")
+          ;;
+        lvmthin|lvm)
+          # LVM storage - check if there's a path we can use
+          path="/var/lib/vz"  # Default for LVM-backed storage
+          ;;
+        zfspool)
+          # ZFS pool - find mount point
+          local dataset=$(pvesm status 2>/dev/null | awk -v n="$name" '$1==n {print $1}')
+          path=$(zfs get -H -o value mountpoint "$dataset" 2>/dev/null || echo "")
+          ;;
+      esac
+      
+      # Add if valid and not already in list
+      if [[ -n "$path" ]] && [[ -d "$path" ]] && [[ ! " ${DISCOVERED_STORAGE[*]} " =~ " $path " ]]; then
+        DISCOVERED_STORAGE+=("$path")
+      fi
+    done < <(pvesm status 2>/dev/null | tail -n +2)
+  fi
+  
+  # Also check common mount points
+  for path in /mnt/pve/* /mnt/*; do
+    if [[ -d "$path" ]] && [[ ! " ${DISCOVERED_STORAGE[*]} " =~ " $path " ]]; then
+      # Check it's not tmpfs and has reasonable space
+      local fs=$(df "$path" 2>/dev/null | awk 'NR==2 {print $1}')
+      local avail=$(df "$path" 2>/dev/null | awk 'NR==2 {print $4}')
+      if [[ "$fs" != "tmpfs" ]] && [[ "${avail:-0}" -gt 2097152 ]]; then  # > 2GB
+        DISCOVERED_STORAGE+=("$path")
+      fi
+    fi
+  done
+  
+  log_verbose "Discovered storage paths: ${DISCOVERED_STORAGE[*]}"
+}
+
+prompt_additional_disks() {
+  # If non-interactive or only one storage, skip
+  if [[ "$INTERACTIVE" != "true" ]] || [[ ${#DISCOVERED_STORAGE[@]} -le 1 ]]; then
+    return
+  fi
+  
+  echo
+  echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "${BOLD}Additional storage paths detected:${NC}"
+  for i in "${!DISCOVERED_STORAGE[@]}"; do
+    if [[ $i -eq 0 ]]; then
+      echo -e "  ${GREEN}[0]${NC} ${DISCOVERED_STORAGE[$i]} (already tested)"
+    else
+      echo -e "  ${CYAN}[$i]${NC} ${DISCOVERED_STORAGE[$i]}"
+    fi
+  done
+  echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo
+  
+  read -p "Test additional storage? (enter numbers separated by space, or 'all', or press Enter to skip): " -t 30 response || response=""
+  
+  if [[ -z "$response" ]]; then
+    return
+  fi
+  
+  ADDITIONAL_DISK_PATHS=()
+  
+  if [[ "$response" == "all" ]]; then
+    for i in "${!DISCOVERED_STORAGE[@]}"; do
+      [[ $i -gt 0 ]] && ADDITIONAL_DISK_PATHS+=("${DISCOVERED_STORAGE[$i]}")
+    done
+  else
+    for num in $response; do
+      if [[ "$num" =~ ^[0-9]+$ ]] && [[ $num -gt 0 ]] && [[ $num -lt ${#DISCOVERED_STORAGE[@]} ]]; then
+        ADDITIONAL_DISK_PATHS+=("${DISCOVERED_STORAGE[$num]}")
+      fi
+    done
+  fi
+  
+  if [[ ${#ADDITIONAL_DISK_PATHS[@]} -gt 0 ]]; then
+    log "Will also benchmark: ${ADDITIONAL_DISK_PATHS[*]}"
+  fi
+}
+
 check_dependencies() {
   log "Checking dependencies..."
   
@@ -1290,6 +1389,7 @@ generate_json() {
     --arg mem_write_ops "${MEM_WRITE_OPS:-0}" \
     --arg mem_read_mbs "${MEM_READ_MBS:-0}" \
     --arg mem_read_ops "${MEM_READ_OPS:-0}" \
+    --arg mem_latency_ms "${MEM_LATENCY_MS:-0}" \
     --argjson disk_randrw_iops_r "${DISK_RANDRW_IOPS_R:-0}" \
     --argjson disk_randrw_iops_w "${DISK_RANDRW_IOPS_W:-0}" \
     --argjson disk_randrw_iops_total "${DISK_RANDRW_IOPS_TOTAL:-0}" \
@@ -1302,10 +1402,20 @@ generate_json() {
     --arg disk_seq_write_mb "${DISK_SEQ_WRITE_MB:-0}" \
     --argjson score_cpu_multi "${SCORE_CPU_MULTI:-0}" \
     --argjson score_cpu_single "${SCORE_CPU_SINGLE:-0}" \
-    --argjson score_memory "${SCORE_MEMORY:-0}" \
-    --argjson score_disk_iops "${SCORE_DISK_IOPS:-0}" \
-    --argjson score_disk_bw "${SCORE_DISK_BW:-0}" \
+    --argjson score_mem_write "${SCORE_MEM_WRITE:-0}" \
+    --argjson score_mem_read "${SCORE_MEM_READ:-0}" \
+    --argjson score_mem_latency "${SCORE_MEM_LATENCY:-0}" \
+    --argjson score_disk_rand_iops "${SCORE_DISK_RAND_IOPS:-0}" \
+    --argjson score_disk_seq_read "${SCORE_DISK_SEQ_READ_BW:-0}" \
+    --argjson score_disk_seq_write "${SCORE_DISK_SEQ_WRITE_BW:-0}" \
+    --argjson score_cpu_total "${SCORE_CPU_TOTAL:-0}" \
+    --argjson score_mem_total "${SCORE_MEM_TOTAL:-0}" \
+    --argjson score_disk_total "${SCORE_DISK_TOTAL:-0}" \
     --argjson score_total "${SCORE_TOTAL:-0}" \
+    --arg net_bw_mbps "${NET_BW_MBPS:-0}" \
+    --arg net_latency_ms "${NET_LATENCY_MS:-0}" \
+    --argjson score_net_bw "${SCORE_NET_BW:-0}" \
+    --argjson score_net_latency "${SCORE_NET_LATENCY:-0}" \
     --argjson tags "$tags_json" \
     --arg notes "$NOTES" \
     '{
@@ -1343,7 +1453,8 @@ generate_json() {
           read: {
             mb_per_sec: ($mem_read_mbs | tonumber),
             total_ops: ($mem_read_ops | tonumber)
-          }
+          },
+          latency_ms: ($mem_latency_ms | tonumber)
         },
         disk: {
           randrw: {
@@ -1362,15 +1473,35 @@ generate_json() {
             iops: $disk_seq_write_iops,
             bw_mb: ($disk_seq_write_mb | tonumber)
           }
+        },
+        network: {
+          bandwidth_mbps: ($net_bw_mbps | tonumber),
+          latency_ms: ($net_latency_ms | tonumber)
         }
       },
       scores: {
-        cpu_multi: $score_cpu_multi,
-        cpu_single: $score_cpu_single,
-        memory: $score_memory,
-        disk_iops: $score_disk_iops,
-        disk_bw: $score_disk_bw,
-        total: $score_total
+        cpu: {
+          multi_thread: $score_cpu_multi,
+          single_thread: $score_cpu_single,
+          total: $score_cpu_total
+        },
+        memory: {
+          write: $score_mem_write,
+          read: $score_mem_read,
+          latency: $score_mem_latency,
+          total: $score_mem_total
+        },
+        disk: {
+          random_iops: $score_disk_rand_iops,
+          seq_read: $score_disk_seq_read,
+          seq_write: $score_disk_seq_write,
+          total: $score_disk_total
+        },
+        network: {
+          bandwidth: $score_net_bw,
+          latency: $score_net_latency
+        },
+        proxmark_score: $score_total
       },
       tags: $tags,
       notes: $notes
@@ -1568,14 +1699,21 @@ write_summary_to_log() {
     echo "  ----------------------------------------------------------------"
     printf "  %-22s %12s %12s %8s\n" "CPU Multi-thread" "-" "${CPU_MULTI_EPS} e/s" "$SCORE_CPU_MULTI"
     printf "  %-22s %12s %12s %8s\n" "CPU Single-thread" "-" "${CPU_SINGLE_EPS} e/s" "$SCORE_CPU_SINGLE"
-    printf "  %-22s %12s %12s %8s\n" "Memory Write" "-" "${MEM_WRITE_MBS} MB/s" "$SCORE_MEMORY"
-    printf "  %-22s %12s %12s %8s\n" "Memory Read" "-" "${MEM_READ_MBS} MB/s" "-"
-    printf "  %-22s %12s %12s %8s\n" "Disk 4K Random R/W" "$DISK_RANDRW_IOPS_TOTAL" "${randrw_total_mb} MB/s" "$SCORE_DISK_IOPS"
-    printf "  %-22s %12s %12s %8s\n" "Disk Seq Read" "${DISK_SEQ_READ_IOPS:-0}" "${DISK_SEQ_READ_MB} MB/s" "$SCORE_DISK_BW"
-    printf "  %-22s %12s %12s %8s\n" "Disk Seq Write" "${DISK_SEQ_WRITE_IOPS:-0}" "${DISK_SEQ_WRITE_MB} MB/s" "-"
+    printf "  %-22s %12s %12s %8s\n" "Memory Write" "-" "${MEM_WRITE_MBS} MB/s" "$SCORE_MEM_WRITE"
+    printf "  %-22s %12s %12s %8s\n" "Memory Read" "-" "${MEM_READ_MBS} MB/s" "$SCORE_MEM_READ"
+    printf "  %-22s %12s %12s %8s\n" "Memory Latency" "-" "${MEM_LATENCY_MS:-0} ms" "$SCORE_MEM_LATENCY"
+    printf "  %-22s %12s %12s %8s\n" "Disk 4K Random R/W" "$DISK_RANDRW_IOPS_TOTAL" "${randrw_total_mb} MB/s" "$SCORE_DISK_RAND_IOPS"
+    printf "  %-22s %12s %12s %8s\n" "Disk Seq Read" "${DISK_SEQ_READ_IOPS:-0}" "${DISK_SEQ_READ_MB} MB/s" "$SCORE_DISK_SEQ_READ_BW"
+    printf "  %-22s %12s %12s %8s\n" "Disk Seq Write" "${DISK_SEQ_WRITE_IOPS:-0}" "${DISK_SEQ_WRITE_MB} MB/s" "$SCORE_DISK_SEQ_WRITE_BW"
+    if [[ -n "$IPERF_SERVER" ]] && [[ "${NET_BW_MBPS:-0}" != "0" ]]; then
+      printf "  %-22s %12s %12s %8s\n" "Network Bandwidth" "-" "${NET_BW_MBPS} Mbps" "$SCORE_NET_BW"
+      printf "  %-22s %12s %12s %8s\n" "Network Latency" "-" "${NET_LATENCY_MS} ms" "$SCORE_NET_LATENCY"
+    fi
+    echo ""
+    echo "Category Scores: CPU: ${SCORE_CPU_TOTAL:-0} | Memory: ${SCORE_MEM_TOTAL:-0} | Disk: ${SCORE_DISK_TOTAL:-0}"
     echo ""
     echo "=========================================="
-    echo "TOTAL SCORE: $SCORE_TOTAL"
+    echo "PROXMARK SCORE: $SCORE_TOTAL"
     echo "=========================================="
     echo ""
     echo "JSON saved: $RESULT_JSON"
@@ -1677,6 +1815,9 @@ main() {
   check_dependencies
   collect_sysinfo
   
+  # Discover available storage paths
+  discover_storage_paths
+  
   run_cpu_benchmark
   run_mem_benchmark
   run_disk_benchmark
@@ -1686,6 +1827,31 @@ main() {
   generate_json
   
   print_summary
+  
+  # Prompt for additional disks if available and interactive
+  if [[ "$ALL_DISKS" == "true" ]]; then
+    # Benchmark all discovered storage
+    for path in "${DISCOVERED_STORAGE[@]:1}"; do
+      echo
+      log "Benchmarking additional storage: $path"
+      DISK_PATH="$path"
+      run_disk_benchmark
+    done
+  else
+    prompt_additional_disks
+    
+    # Benchmark additional paths if user selected any
+    if [[ ${#ADDITIONAL_DISK_PATHS[@]} -gt 0 ]]; then
+      for path in "${ADDITIONAL_DISK_PATHS[@]}"; do
+        echo
+        log "Benchmarking additional storage: $path"
+        DISK_PATH="$path"
+        run_disk_benchmark
+        # TODO: Store results per disk
+      done
+    fi
+  fi
+  
   upload_results
   
   log_success "Benchmark complete!"
