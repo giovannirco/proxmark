@@ -813,6 +813,54 @@ collect_sysinfo() {
     fi
   fi
   
+  # Try cpupower if available (common on Proxmox)
+  if [[ -z "$CPU_FREQ_BASE_MHZ" || "$CPU_FREQ_BASE_MHZ" == "0" ]]; then
+    if command -v cpupower >/dev/null 2>&1; then
+      local cpupower_out=$(cpupower frequency-info 2>/dev/null)
+      # Look for "hardware limits" which shows min - max
+      local hw_limits=$(echo "$cpupower_out" | grep "hardware limits" | grep -oE '[0-9.]+ [GM]Hz' | head -2)
+      if [[ -n "$hw_limits" ]]; then
+        # First value is min, we want something in between or documented base
+        local min_freq=$(echo "$hw_limits" | head -1)
+        # Extract number and unit
+        local min_val=$(echo "$min_freq" | grep -oE '[0-9.]+')
+        local min_unit=$(echo "$min_freq" | grep -oE '[GM]Hz')
+        # This is actually the hardware minimum, not base - skip it
+      fi
+    fi
+  fi
+  
+  # Last resort for AMD: check if boost is disabled and use max as base
+  if [[ -z "$CPU_FREQ_BASE_MHZ" || "$CPU_FREQ_BASE_MHZ" == "0" ]]; then
+    if [[ -f /sys/devices/system/cpu/cpufreq/boost ]]; then
+      local boost_enabled=$(cat /sys/devices/system/cpu/cpufreq/boost 2>/dev/null)
+      if [[ "$boost_enabled" == "0" ]]; then
+        # Boost disabled, max freq IS the base
+        CPU_FREQ_BASE_MHZ="$CPU_FREQ_MAX_MHZ"
+      fi
+    fi
+  fi
+  
+  # AMD Ryzen: try to get nominal frequency from amd_pstate driver
+  if [[ -z "$CPU_FREQ_BASE_MHZ" || "$CPU_FREQ_BASE_MHZ" == "0" ]]; then
+    if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/amd_pstate_highest_perf ]]; then
+      # amd_pstate driver exposes performance levels, nominal is documented elsewhere
+      # For now, estimate base as ~70% of max for typical Ryzen
+      if [[ -n "$CPU_FREQ_MAX_MHZ" && "$CPU_FREQ_MAX_MHZ" -gt 0 ]]; then
+        CPU_FREQ_BASE_MHZ=$(awk "BEGIN {printf \"%.0f\", $CPU_FREQ_MAX_MHZ * 0.71}")
+      fi
+    fi
+  fi
+  
+  # Generic AMD fallback: if vendor is AMD and we have max but no base
+  # estimate base as ~71% of boost (common Ryzen pattern: 3.1GHz base / 4.35GHz boost ≈ 71%)
+  if [[ -z "$CPU_FREQ_BASE_MHZ" || "$CPU_FREQ_BASE_MHZ" == "0" ]]; then
+    if [[ "$CPU_VENDOR" == "AMD" || "$CPU_VENDOR" == "Advanced Micro Devices" ]] && [[ -n "$CPU_FREQ_MAX_MHZ" && "$CPU_FREQ_MAX_MHZ" -gt 0 ]]; then
+      # Round to nearest 100 MHz for cleaner display
+      CPU_FREQ_BASE_MHZ=$(awk "BEGIN {printf \"%.0f\", int($CPU_FREQ_MAX_MHZ * 0.71 / 100 + 0.5) * 100}")
+    fi
+  fi
+  
   # Get max/boost frequency if not already set
   if [[ -z "$CPU_FREQ_MAX_MHZ" || "$CPU_FREQ_MAX_MHZ" == "0" ]]; then
     if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq ]]; then
@@ -2015,28 +2063,38 @@ print_summary() {
   # Calculate combined MB/s for random r/w
   local randrw_total_mb=$(awk "BEGIN {printf \"%.2f\", ${DISK_RANDRW_BW_R_MB:-0} + ${DISK_RANDRW_BW_W_MB:-0}}")
   
-  echo -e "${DIM}┌────────────┬─────────────────────┬──────────────┬──────────────┬──────────┐${NC}"
-  echo -e "${DIM}│${NC}${BOLD} Component  ${DIM}│${NC}${BOLD} Test                ${DIM}│${NC}${BOLD} IOPS         ${DIM}│${NC}${BOLD} Throughput   ${DIM}│${NC}${BOLD} Score    ${DIM}│${NC}"
-  echo -e "${DIM}├────────────┼─────────────────────┼──────────────┼──────────────┼──────────┤${NC}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "CPU" "Multi-thread" "${CPU_MULTI_EPS} e/s" "${SCORE_CPU_MULTI}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "CPU" "Single-thread" "${CPU_SINGLE_EPS} e/s" "${SCORE_CPU_SINGLE}"
-  echo -e "${DIM}├────────────┼─────────────────────┼──────────────┼──────────────┼──────────┤${NC}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Memory" "Write" "${MEM_WRITE_MBS} MB/s" "${SCORE_MEM_WRITE}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Memory" "Read" "${MEM_READ_MBS} MB/s" "${SCORE_MEM_READ}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Memory" "Latency" "${MEM_LATENCY_MS:-0} ms" "${SCORE_MEM_LATENCY}"
-  echo -e "${DIM}├────────────┼─────────────────────┼──────────────┼──────────────┼──────────┤${NC}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC} %12s ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Disk" "4K Random R/W" "${DISK_RANDRW_IOPS_TOTAL}" "${randrw_total_mb} MB/s" "${SCORE_DISK_RAND_IOPS}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC} %12s ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Disk" "Sequential Read" "${DISK_SEQ_READ_IOPS:-0}" "${DISK_SEQ_READ_MB} MB/s" "${SCORE_DISK_SEQ_READ_BW}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC} %12s ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Disk" "Sequential Write" "${DISK_SEQ_WRITE_IOPS:-0}" "${DISK_SEQ_WRITE_MB} MB/s" "${SCORE_DISK_SEQ_WRITE_BW}"
+  # Format throughput values to fit in column (truncate decimals if needed)
+  local cpu_multi_tput=$(printf "%.0f e/s" "${CPU_MULTI_EPS}")
+  local cpu_single_tput=$(printf "%.0f e/s" "${CPU_SINGLE_EPS}")
+  local mem_write_tput=$(printf "%.0f MB/s" "${MEM_WRITE_MBS}")
+  local mem_read_tput=$(printf "%.0f MB/s" "${MEM_READ_MBS}")
+  local mem_lat_tput=$(printf "%.4f ms" "${MEM_LATENCY_MS:-0}")
+  local disk_rand_tput=$(printf "%.0f MB/s" "${randrw_total_mb}")
+  local disk_seqr_tput=$(printf "%.0f MB/s" "${DISK_SEQ_READ_MB}")
+  local disk_seqw_tput=$(printf "%.0f MB/s" "${DISK_SEQ_WRITE_MB}")
+  
+  echo -e "${DIM}┌────────────┬───────────────────┬──────────────┬────────────────┬──────────┐${NC}"
+  echo -e "${DIM}│${NC}${BOLD} Component  ${DIM}│${NC}${BOLD} Test              ${DIM}│${NC}${BOLD} IOPS         ${DIM}│${NC}${BOLD} Throughput     ${DIM}│${NC}${BOLD} Score    ${DIM}│${NC}"
+  echo -e "${DIM}├────────────┼───────────────────┼──────────────┼────────────────┼──────────┤${NC}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-17s ${DIM}│${NC} %12s ${DIM}│${NC} %14s ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "CPU" "Multi-thread" "-" "$cpu_multi_tput" "${SCORE_CPU_MULTI}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-17s ${DIM}│${NC} %12s ${DIM}│${NC} %14s ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "CPU" "Single-thread" "-" "$cpu_single_tput" "${SCORE_CPU_SINGLE}"
+  echo -e "${DIM}├────────────┼───────────────────┼──────────────┼────────────────┼──────────┤${NC}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-17s ${DIM}│${NC} %12s ${DIM}│${NC} %14s ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Memory" "Write" "-" "$mem_write_tput" "${SCORE_MEM_WRITE}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-17s ${DIM}│${NC} %12s ${DIM}│${NC} %14s ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Memory" "Read" "-" "$mem_read_tput" "${SCORE_MEM_READ}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-17s ${DIM}│${NC} %12s ${DIM}│${NC} %14s ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Memory" "Latency" "-" "$mem_lat_tput" "${SCORE_MEM_LATENCY}"
+  echo -e "${DIM}├────────────┼───────────────────┼──────────────┼────────────────┼──────────┤${NC}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-17s ${DIM}│${NC} %12s ${DIM}│${NC} %14s ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Disk" "4K Random R/W" "${DISK_RANDRW_IOPS_TOTAL}" "$disk_rand_tput" "${SCORE_DISK_RAND_IOPS}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-17s ${DIM}│${NC} %12s ${DIM}│${NC} %14s ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Disk" "Seq Read" "${DISK_SEQ_READ_IOPS:-0}" "$disk_seqr_tput" "${SCORE_DISK_SEQ_READ_BW}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-17s ${DIM}│${NC} %12s ${DIM}│${NC} %14s ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Disk" "Seq Write" "${DISK_SEQ_WRITE_IOPS:-0}" "$disk_seqw_tput" "${SCORE_DISK_SEQ_WRITE_BW}"
   
   # Network section (only if iperf was run)
   if [[ -n "$IPERF_SERVER" ]] && [[ "${NET_BW_MBPS:-0}" != "0" ]]; then
-    echo -e "${DIM}├────────────┼─────────────────────┼──────────────┼──────────────┼──────────┤${NC}"
-    printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Network" "Bandwidth" "${NET_BW_MBPS} Mbps" "${SCORE_NET_BW}"
-    printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Network" "Latency" "${NET_LATENCY_MS} ms" "${SCORE_NET_LATENCY}"
+    echo -e "${DIM}├────────────┼───────────────────┼──────────────┼────────────────┼──────────┤${NC}"
+    printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-17s ${DIM}│${NC} %12s ${DIM}│${NC} %14s ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Network" "Bandwidth" "-" "${NET_BW_MBPS} Mbps" "${SCORE_NET_BW}"
+    printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-17s ${DIM}│${NC} %12s ${DIM}│${NC} %14s ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Network" "Latency" "-" "${NET_LATENCY_MS} ms" "${SCORE_NET_LATENCY}"
   fi
   
-  echo -e "${DIM}└────────────┴─────────────────────┴──────────────┴──────────────┴──────────┘${NC}"
+  echo -e "${DIM}└────────────┴───────────────────┴──────────────┴────────────────┴──────────┘${NC}"
   echo
   
   # Category subtotals
