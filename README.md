@@ -34,33 +34,35 @@ Perfect for:
 Open the shell from your Proxmox web UI (Node → Shell) or SSH into your node and run:
 
 ```bash
-curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/master/client/proxmark.sh | bash
+curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/v1.0.0/client/proxmark.sh | bash
 ```
 
 **With options** (benchmark your VM storage):
 
 ```bash
-curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/master/client/proxmark.sh | bash -s -- --disk-path /var/lib/vz
+curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/v1.0.0/client/proxmark.sh | bash -s -- --disk-path /var/lib/vz
 ```
 
 **Quick mode** (~2 minutes):
 
 ```bash
-curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/master/client/proxmark.sh | bash -s -- --quick
+curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/v1.0.0/client/proxmark.sh | bash -s -- --quick
 ```
 
 **Debug mode** (troubleshooting):
 
 ```bash
-curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/master/client/proxmark.sh | bash -s -- --debug
+curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/v1.0.0/client/proxmark.sh | bash -s -- --debug
 ```
+
+> **Tip**: Replace `v1.0.0` with `master` to always get the latest development version.
 
 ### Download and Inspect First
 
 If you prefer to review the script before running:
 
 ```bash
-curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/master/client/proxmark.sh -o proxmark.sh
+curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/v1.0.0/client/proxmark.sh -o proxmark.sh
 less proxmark.sh
 bash proxmark.sh
 ```
