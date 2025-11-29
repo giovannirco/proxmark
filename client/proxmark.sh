@@ -701,29 +701,99 @@ collect_sysinfo() {
   # CPU frequency detection (base and max/boost)
   CPU_FREQ_BASE_MHZ=""
   CPU_FREQ_MAX_MHZ=""
+  CPU_FREQ_CURRENT_MHZ=""
+  CPU_TDP_WATTS=""
+  POWER_DRAW_WATTS=""
   
   # Try to get base frequency from cpufreq
   if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/base_frequency ]]; then
     local base_khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/base_frequency 2>/dev/null || echo 0)
     CPU_FREQ_BASE_MHZ=$((base_khz / 1000))
-  elif [[ -f /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq ]]; then
-    # Fallback: use min freq as approximation (not always accurate)
-    local min_khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq 2>/dev/null || echo 0)
-    # Only use if it's reasonable (> 800 MHz)
-    if [[ $min_khz -gt 800000 ]]; then
-      CPU_FREQ_BASE_MHZ=$((min_khz / 1000))
+  fi
+  
+  # Try lshw for base frequency (shown as "size" = current, "capacity" = max)
+  if [[ -z "$CPU_FREQ_BASE_MHZ" || "$CPU_FREQ_BASE_MHZ" == "0" ]] && command -v lshw >/dev/null 2>&1; then
+    local lshw_cpu=$(run_as_root lshw -C cpu 2>/dev/null || echo "")
+    if [[ -n "$lshw_cpu" ]]; then
+      # lshw shows "clock: 100MHz" which is the base clock, and "capacity: 4367MHz" for max
+      # The "size" field shows current frequency
+      local lshw_size=$(echo "$lshw_cpu" | grep "size:" | head -1 | sed 's/.*size: //' | grep -oE '[0-9]+')
+      local lshw_capacity=$(echo "$lshw_cpu" | grep "capacity:" | head -1 | sed 's/.*capacity: //' | grep -oE '[0-9]+')
+      
+      # Current frequency
+      [[ -n "$lshw_size" ]] && CPU_FREQ_CURRENT_MHZ="$lshw_size"
+      # Max frequency from capacity
+      [[ -n "$lshw_capacity" ]] && CPU_FREQ_MAX_MHZ="$lshw_capacity"
     fi
   fi
   
-  # Get max/boost frequency
-  if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq ]]; then
-    local max_khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null || echo 0)
-    CPU_FREQ_MAX_MHZ=$((max_khz / 1000))
-  elif grep -q "cpu MHz" /proc/cpuinfo; then
-    CPU_FREQ_MAX_MHZ=$(grep -m1 "cpu MHz" /proc/cpuinfo | awk '{printf "%.0f", $4}')
+  # Fallback: use min freq as base approximation
+  if [[ -z "$CPU_FREQ_BASE_MHZ" || "$CPU_FREQ_BASE_MHZ" == "0" ]]; then
+    if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq ]]; then
+      local min_khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq 2>/dev/null || echo 0)
+      # Only use if it's reasonable (> 800 MHz)
+      if [[ $min_khz -gt 800000 ]]; then
+        CPU_FREQ_BASE_MHZ=$((min_khz / 1000))
+      fi
+    fi
   fi
   
-  log_verbose "CPU: vendor=$CPU_VENDOR, socket=$CPU_SOCKET, arch=$CPU_ARCH, L1=$CPU_CACHE_L1, L2=$CPU_CACHE_L2, L3=$CPU_CACHE_L3"
+  # Try to extract base frequency from CPU model name (e.g., "@ 3.50GHz")
+  if [[ -z "$CPU_FREQ_BASE_MHZ" || "$CPU_FREQ_BASE_MHZ" == "0" ]]; then
+    local model_freq=$(echo "$CPU_MODEL" | grep -oE '@[[:space:]]*[0-9]+\.[0-9]+GHz' | grep -oE '[0-9]+\.[0-9]+')
+    if [[ -n "$model_freq" ]]; then
+      CPU_FREQ_BASE_MHZ=$(awk "BEGIN {printf \"%.0f\", $model_freq * 1000}")
+    fi
+  fi
+  
+  # Get max/boost frequency if not already set
+  if [[ -z "$CPU_FREQ_MAX_MHZ" || "$CPU_FREQ_MAX_MHZ" == "0" ]]; then
+    if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq ]]; then
+      local max_khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null || echo 0)
+      CPU_FREQ_MAX_MHZ=$((max_khz / 1000))
+    elif grep -q "cpu MHz" /proc/cpuinfo; then
+      CPU_FREQ_MAX_MHZ=$(grep -m1 "cpu MHz" /proc/cpuinfo | awk '{printf "%.0f", $4}')
+    fi
+  fi
+  
+  # CPU TDP from RAPL (Running Average Power Limit)
+  # Intel: /sys/class/powercap/intel-rapl/intel-rapl:0/constraint_0_max_power_uw
+  # AMD: Similar path or via /sys/devices/system/cpu/cpufreq/*/energy_performance_preference
+  if [[ -f /sys/class/powercap/intel-rapl/intel-rapl:0/constraint_0_max_power_uw ]]; then
+    local tdp_uw=$(cat /sys/class/powercap/intel-rapl/intel-rapl:0/constraint_0_max_power_uw 2>/dev/null || echo 0)
+    if [[ $tdp_uw -gt 0 ]]; then
+      CPU_TDP_WATTS=$((tdp_uw / 1000000))
+    fi
+  elif [[ -f /sys/class/powercap/intel-rapl:0/constraint_0_max_power_uw ]]; then
+    local tdp_uw=$(cat /sys/class/powercap/intel-rapl:0/constraint_0_max_power_uw 2>/dev/null || echo 0)
+    if [[ $tdp_uw -gt 0 ]]; then
+      CPU_TDP_WATTS=$((tdp_uw / 1000000))
+    fi
+  fi
+  
+  # Current power draw from RAPL energy counter
+  # We can sample energy_uj twice with a delay and calculate power
+  local energy_file=""
+  if [[ -f /sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj ]]; then
+    energy_file="/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj"
+  elif [[ -f /sys/class/powercap/intel-rapl:0/energy_uj ]]; then
+    energy_file="/sys/class/powercap/intel-rapl:0/energy_uj"
+  fi
+  
+  if [[ -n "$energy_file" && -f "$energy_file" ]]; then
+    local e1=$(cat "$energy_file" 2>/dev/null || echo 0)
+    sleep 0.5
+    local e2=$(cat "$energy_file" 2>/dev/null || echo 0)
+    if [[ $e2 -gt $e1 ]]; then
+      # Power = energy / time, energy is in microjoules, time is 0.5s
+      local energy_diff=$((e2 - e1))
+      POWER_DRAW_WATTS=$(awk "BEGIN {printf \"%.1f\", $energy_diff / 500000}")
+    fi
+  fi
+  
+  log_verbose "CPU: vendor=$CPU_VENDOR, socket=$CPU_SOCKET, arch=$CPU_ARCH, base=${CPU_FREQ_BASE_MHZ}MHz, max=${CPU_FREQ_MAX_MHZ}MHz, tdp=${CPU_TDP_WATTS}W"
+  log_verbose "CPU cache: L1=$CPU_CACHE_L1, L2=$CPU_CACHE_L2, L3=$CPU_CACHE_L3"
+  log_verbose "Power: current=${POWER_DRAW_WATTS}W"
   
   # Memory info
   MEM_TOTAL_KB="$(grep MemTotal /proc/meminfo | awk '{print $2}')"
@@ -1046,6 +1116,8 @@ collect_sysinfo() {
     --argjson cpu_sockets "$CPU_SOCKETS" \
     --arg cpu_freq_base_mhz "${CPU_FREQ_BASE_MHZ:-}" \
     --arg cpu_freq_max_mhz "${CPU_FREQ_MAX_MHZ:-}" \
+    --arg cpu_tdp_watts "${CPU_TDP_WATTS:-}" \
+    --arg power_draw_watts "${POWER_DRAW_WATTS:-}" \
     --arg cpu_cache_l1 "${CPU_CACHE_L1:-}" \
     --arg cpu_cache_l2 "${CPU_CACHE_L2:-}" \
     --arg cpu_cache_l3 "${CPU_CACHE_L3:-}" \
@@ -1087,11 +1159,15 @@ collect_sysinfo() {
         sockets: $cpu_sockets,
         freq_base_mhz: $cpu_freq_base_mhz,
         freq_max_mhz: $cpu_freq_max_mhz,
+        tdp_watts: $cpu_tdp_watts,
         cache: {
           l1: $cpu_cache_l1,
           l2: $cpu_cache_l2,
           l3: $cpu_cache_l3
         }
+      },
+      power: {
+        current_watts: $power_draw_watts
       },
       memory: {
         total_mb: $mem_mb,
@@ -1747,12 +1823,25 @@ print_summary() {
   echo -e "  ${BOLD}Sockets:${NC}      $CPU_SOCKETS"
   [[ -n "$CPU_SOCKET" ]] && echo -e "  ${BOLD}Socket:${NC}       $CPU_SOCKET"
   [[ -n "$CPU_ARCH" ]] && echo -e "  ${BOLD}Architecture:${NC} $CPU_ARCH"
-  if [[ -n "$CPU_FREQ_BASE_MHZ" && "$CPU_FREQ_BASE_MHZ" != "0" ]]; then
+  
+  # Frequency info - show base and max on same line if both available
+  if [[ -n "$CPU_FREQ_BASE_MHZ" && "$CPU_FREQ_BASE_MHZ" != "0" ]] && [[ -n "$CPU_FREQ_MAX_MHZ" && "$CPU_FREQ_MAX_MHZ" != "0" ]]; then
+    echo -e "  ${BOLD}Frequency:${NC}    ${CPU_FREQ_BASE_MHZ} MHz base / ${CPU_FREQ_MAX_MHZ} MHz boost"
+  elif [[ -n "$CPU_FREQ_BASE_MHZ" && "$CPU_FREQ_BASE_MHZ" != "0" ]]; then
     echo -e "  ${BOLD}Base Freq:${NC}    ${CPU_FREQ_BASE_MHZ} MHz"
-  fi
-  if [[ -n "$CPU_FREQ_MAX_MHZ" && "$CPU_FREQ_MAX_MHZ" != "0" ]]; then
+  elif [[ -n "$CPU_FREQ_MAX_MHZ" && "$CPU_FREQ_MAX_MHZ" != "0" ]]; then
     echo -e "  ${BOLD}Max Freq:${NC}     ${CPU_FREQ_MAX_MHZ} MHz"
   fi
+  
+  # TDP and power
+  if [[ -n "$CPU_TDP_WATTS" && "$CPU_TDP_WATTS" != "0" ]]; then
+    local power_info="TDP: ${CPU_TDP_WATTS}W"
+    [[ -n "$POWER_DRAW_WATTS" && "$POWER_DRAW_WATTS" != "0" ]] && power_info+=" (current: ${POWER_DRAW_WATTS}W)"
+    echo -e "  ${BOLD}Power:${NC}        $power_info"
+  elif [[ -n "$POWER_DRAW_WATTS" && "$POWER_DRAW_WATTS" != "0" ]]; then
+    echo -e "  ${BOLD}Power Draw:${NC}   ${POWER_DRAW_WATTS}W"
+  fi
+  
   # Cache info
   if [[ -n "$CPU_CACHE_L1" || -n "$CPU_CACHE_L2" || -n "$CPU_CACHE_L3" ]]; then
     local cache_info=""
@@ -2075,5 +2164,6 @@ main() {
 }
 
 main "$@"
+
 
 
