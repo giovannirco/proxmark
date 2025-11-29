@@ -13,7 +13,7 @@
 set -euo pipefail
 
 # === Version ===
-VERSION="1.0.8"
+VERSION="1.0.9"
 
 # === Colors ===
 RED='\033[0;31m'
