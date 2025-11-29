@@ -24,8 +24,8 @@
 - [x] Check for required tools (sysbench, fio, jq)
 - [x] Auto-install missing dependencies via apt
 - [x] Add `--no-install` flag to skip auto-install
+- [x] Verify running on Proxmox host (warn if not detected)
 - [ ] Validate tool versions meet minimum requirements
-- [ ] Verify running on Proxmox host (warn if not detected)
 
 #### System Information Collection
 - [x] Hostname
@@ -70,10 +70,11 @@
 - [x] Cleanup test file after run
 - [x] Disk space check before fio test
 - [x] I/O engine fallback (libaio → sync)
+- [x] Auto-detect /var/lib/vz or primary Proxmox storage
+- [x] Warn when benchmarking tmpfs (RAM disk)
 - [ ] Parse latency metrics from fio
 - [ ] Direct I/O option (`--disk-direct`)
 - [ ] Configurable test file size (`--disk-size`)
-- [ ] Auto-detect /var/lib/vz or primary Proxmox storage
 
 ### 1.3 Output & UX
 
@@ -87,6 +88,7 @@
 - [x] Box-drawing characters
 - [x] Verbose mode (`-v`, `--verbose`)
 - [x] Quiet mode (`-q`, `--quiet`)
+- [x] Debug mode (`--debug`) with system info dump
 - [ ] Progress bar for each test (live update)
 - [ ] ETA display
 - [ ] Spinner while running tests

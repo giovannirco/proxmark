@@ -13,7 +13,7 @@
 set -euo pipefail
 
 # === Version ===
-VERSION="1.0.0"
+VERSION="1.0.1"
 
 # === Colors ===
 RED='\033[0;31m'
@@ -402,13 +402,12 @@ require_cmd_or_install() {
   case "$PKG_MANAGER" in
     apt)
       log_debug "Running: apt-get update"
-      if ! run_as_root apt-get update -qq 2>&1; then
-        log_error "Failed to update apt cache"
-        exit 1
-      fi
+      # Don't fail on apt-get update errors (e.g., Proxmox enterprise repos without subscription)
+      run_as_root apt-get update 2>&1 | grep -v "^Hit:\|^Get:\|^Reading" | head -5 || true
       log_debug "Running: apt-get install -y $pkg"
-      if ! run_as_root apt-get install -y "$pkg" 2>&1 | grep -v "^Reading\|^Building\|^Processing"; then
+      if ! run_as_root apt-get install -y "$pkg" 2>&1 | grep -v "^Reading\|^Building\|^Processing\|^Selecting\|^Preparing\|^Unpacking\|^Setting"; then
         log_error "Failed to install $pkg"
+        log_error "Try running: apt-get update && apt-get install -y $pkg"
         exit 1
       fi
       ;;
@@ -435,10 +434,36 @@ require_cmd_or_install() {
   log_success "Installed $pkg"
 }
 
+check_proxmox() {
+  IS_PROXMOX=false
+  
+  # Check for Proxmox indicators
+  if [[ -d /etc/pve ]] || command -v pveversion >/dev/null 2>&1; then
+    IS_PROXMOX=true
+    log_verbose "Proxmox VE detected"
+  else
+    log_warning "Proxmox VE not detected - this tool is designed for Proxmox hosts"
+    log_warning "Results may not be accurate on non-Proxmox systems"
+  fi
+  
+  # Auto-detect best disk path for Proxmox
+  if [[ "$DISK_PATH" == "/tmp" ]] && [[ "$IS_PROXMOX" == "true" ]]; then
+    if [[ -d /var/lib/vz ]]; then
+      # Check if /var/lib/vz is a real storage (not just tmpfs)
+      local vz_fs=$(df /var/lib/vz 2>/dev/null | awk 'NR==2 {print $1}')
+      if [[ "$vz_fs" != "tmpfs" ]] && [[ -n "$vz_fs" ]]; then
+        DISK_PATH="/var/lib/vz"
+        log_verbose "Auto-detected Proxmox storage: $DISK_PATH"
+      fi
+    fi
+  fi
+}
+
 check_dependencies() {
   log "Checking dependencies..."
   
   detect_os
+  check_proxmox
   
   require_cmd_or_install sysbench sysbench
   require_cmd_or_install fio fio
@@ -549,6 +574,7 @@ collect_sysinfo() {
     --arg kernel "$KERNEL" \
     --arg os "$OS" \
     --arg virt "$VIRT_TYPE" \
+    --argjson is_proxmox "$([[ "${IS_PROXMOX:-false}" == "true" ]] && echo "true" || echo "false")" \
     --arg pve_version "$PROXMOX_VERSION" \
     --arg root_dev "$ROOT_DEV" \
     --arg disk_model "$DISK_MODEL" \
@@ -565,6 +591,7 @@ collect_sysinfo() {
       kernel: $kernel,
       os: $os,
       virtualization: $virt,
+      is_proxmox: $is_proxmox,
       proxmox_version: $pve_version,
       root_device: $root_dev,
       disk_model: $disk_model,
@@ -644,6 +671,13 @@ run_disk_benchmark() {
   
   mkdir -p "$DISK_PATH"
   local filename="${DISK_PATH}/proxmark-fio-testfile"
+  
+  # Check if benchmarking tmpfs (RAM disk) - warn user
+  local disk_fs=$(df "$DISK_PATH" 2>/dev/null | awk 'NR==2 {print $1}')
+  if [[ "$disk_fs" == "tmpfs" ]]; then
+    log_warning "Disk path '$DISK_PATH' is tmpfs (RAM disk) - results won't reflect actual storage performance"
+    log_warning "Use --disk-path /var/lib/vz to benchmark your VM storage"
+  fi
   
   # Check disk space
   local available_kb=$(df "$DISK_PATH" | awk 'NR==2 {print $4}')
