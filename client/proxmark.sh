@@ -13,7 +13,7 @@
 set -euo pipefail
 
 # === Version ===
-VERSION="1.0.5"
+VERSION="1.0.6"
 
 # === Colors ===
 RED='\033[0;31m'
@@ -611,24 +611,50 @@ collect_sysinfo() {
   
   # Resolve the actual physical device
   if [[ "$ROOT_DEV" == /dev/mapper/* ]]; then
-    # LVM or device-mapper - try to find underlying physical device
-    local dm_name=$(basename "$ROOT_DEV")
-    if [[ -e "/sys/block/$dm_name/slaves" ]]; then
+    # LVM or device-mapper - need to resolve /dev/mapper/name to dm-X first
+    # /dev/mapper/pve-root is a symlink to /dev/dm-X
+    local real_dev=$(readlink -f "$ROOT_DEV" 2>/dev/null)
+    local dm_name=$(basename "$real_dev" 2>/dev/null)
+    log_verbose "Resolving LVM: $ROOT_DEV -> $real_dev ($dm_name)"
+    
+    if [[ "$dm_name" == dm-* ]] && [[ -d "/sys/block/$dm_name/slaves" ]]; then
       # Get first slave device (the physical volume)
       local slave=$(ls "/sys/block/$dm_name/slaves" 2>/dev/null | head -1)
+      log_verbose "Found slave device: $slave"
       if [[ -n "$slave" ]]; then
         # Recursively check if slave is also a dm device
-        while [[ -e "/sys/block/$slave/slaves" ]] && [[ -n "$(ls /sys/block/$slave/slaves 2>/dev/null)" ]]; do
+        while [[ -d "/sys/block/$slave/slaves" ]] && [[ -n "$(ls /sys/block/$slave/slaves 2>/dev/null)" ]]; do
           slave=$(ls "/sys/block/$slave/slaves" 2>/dev/null | head -1)
+          log_verbose "Following chain to: $slave"
         done
         PHYSICAL_DEV="/dev/$slave"
       fi
     fi
+    
     # Try lsblk as fallback
-    if [[ -z "$PHYSICAL_DEV" ]] && command -v lsblk >/dev/null 2>&1; then
-      PHYSICAL_DEV=$(lsblk -no PKNAME "$ROOT_DEV" 2>/dev/null | head -1)
-      [[ -n "$PHYSICAL_DEV" ]] && PHYSICAL_DEV="/dev/$PHYSICAL_DEV"
+    if [[ -z "$PHYSICAL_DEV" || "$PHYSICAL_DEV" == "/dev/" ]] && command -v lsblk >/dev/null 2>&1; then
+      local pkname=$(lsblk -no PKNAME "$ROOT_DEV" 2>/dev/null | grep -v '^$' | tail -1)
+      if [[ -n "$pkname" ]]; then
+        PHYSICAL_DEV="/dev/$pkname"
+        log_verbose "lsblk found parent: $pkname"
+      fi
     fi
+    
+    # Try dmsetup as another fallback
+    if [[ -z "$PHYSICAL_DEV" || "$PHYSICAL_DEV" == "/dev/" ]] && command -v dmsetup >/dev/null 2>&1; then
+      local deps=$(run_as_root dmsetup deps "$ROOT_DEV" 2>/dev/null | grep -oE '\([0-9]+, [0-9]+\)' | head -1)
+      if [[ -n "$deps" ]]; then
+        local major=$(echo "$deps" | grep -oE '[0-9]+' | head -1)
+        local minor=$(echo "$deps" | grep -oE '[0-9]+' | tail -1)
+        # Find device with this major:minor
+        local dev_path=$(ls -la /dev 2>/dev/null | awk -v maj="$major" -v min="$minor" '$5==maj"," && $6==min {print "/dev/"$10}' | head -1)
+        if [[ -n "$dev_path" ]]; then
+          PHYSICAL_DEV="$dev_path"
+          log_verbose "dmsetup found device: $dev_path (major:$major minor:$minor)"
+        fi
+      fi
+    fi
+    
     log_verbose "LVM device $ROOT_DEV -> physical device: ${PHYSICAL_DEV:-unknown}"
   elif [[ "$ROOT_DEV" == /dev/* ]]; then
     PHYSICAL_DEV="$ROOT_DEV"
@@ -1179,12 +1205,75 @@ print_summary() {
   
   # File paths
   echo -e "${DIM}📁 JSON saved:${NC} $RESULT_JSON"
+  echo -e "${DIM}📋 Log file:${NC} $LOG_FILE"
   if [[ "$DEBUG" == "true" ]]; then
-    echo -e "${DIM}📋 Log file:${NC} $LOG_FILE"
     echo -e "${DIM}🔍 Debug file:${NC} $DEBUG_FILE"
   fi
   echo -e "${DIM}🌐 Result URL:${NC} ${YELLOW}(coming soon - proxmark.io)${NC}"
   echo
+  
+  # Write summary to log file for later reference
+  write_summary_to_log
+}
+
+write_summary_to_log() {
+  local randrw_total_mb=$(awk "BEGIN {printf \"%.2f\", ${DISK_RANDRW_BW_R_MB:-0} + ${DISK_RANDRW_BW_W_MB:-0}}")
+  
+  {
+    echo ""
+    echo "=========================================="
+    echo "BENCHMARK RESULTS SUMMARY"
+    echo "=========================================="
+    echo ""
+    echo "SYSTEM INFORMATION"
+    echo "----------------------------------------"
+    echo "  Hostname:     $HOSTNAME"
+    echo "  OS:           $OS"
+    echo "  Kernel:       $KERNEL"
+    [[ -n "$PROXMOX_VERSION" ]] && echo "  Proxmox:      $PROXMOX_VERSION"
+    echo ""
+    echo "CPU"
+    echo "----------------------------------------"
+    echo "  Model:        $CPU_MODEL"
+    echo "  Cores:        $CPU_CORES cores / $CPU_THREADS threads"
+    echo "  Sockets:      $CPU_SOCKETS"
+    [[ -n "$CPU_FREQ_BASE_MHZ" && "$CPU_FREQ_BASE_MHZ" != "0" ]] && echo "  Base Freq:    ${CPU_FREQ_BASE_MHZ} MHz"
+    [[ -n "$CPU_FREQ_MAX_MHZ" && "$CPU_FREQ_MAX_MHZ" != "0" ]] && echo "  Max Freq:     ${CPU_FREQ_MAX_MHZ} MHz"
+    echo ""
+    echo "MEMORY"
+    echo "----------------------------------------"
+    echo "  Total:        $((MEM_TOTAL_MB / 1024)) GB (${MEM_TOTAL_MB} MB)"
+    [[ "$MEM_TYPE" != "unknown" && -n "$MEM_TYPE" ]] && echo "  Type:         $MEM_TYPE"
+    [[ -n "$MEM_SPEED" ]] && echo "  Speed:        $MEM_SPEED"
+    echo ""
+    echo "STORAGE"
+    echo "----------------------------------------"
+    echo "  Test Path:    $DISK_PATH"
+    echo "  Device:       $ROOT_DEV"
+    [[ -n "$DISK_MODEL" ]] && echo "  Model:        $DISK_MODEL"
+    echo "  Type:         ${DISK_TYPE^^}"
+    [[ $DISK_SIZE_GB -gt 0 ]] && echo "  Size:         ${DISK_SIZE_GB} GB"
+    echo ""
+    echo "BENCHMARK RESULTS"
+    echo "----------------------------------------"
+    printf "  %-20s %15s %10s\n" "Test" "Value" "Score"
+    echo "  ----------------------------------------"
+    printf "  %-20s %12s e/s %10s\n" "CPU Multi-thread" "$CPU_MULTI_EPS" "$SCORE_CPU_MULTI"
+    printf "  %-20s %12s e/s %10s\n" "CPU Single-thread" "$CPU_SINGLE_EPS" "$SCORE_CPU_SINGLE"
+    printf "  %-20s %10s MB/s %10s\n" "Memory Write" "$MEM_WRITE_MBS" "$SCORE_MEMORY"
+    printf "  %-20s %10s MB/s %10s\n" "Memory Read" "$MEM_READ_MBS" "-"
+    printf "  %-20s %10s IOPS %10s\n" "Disk 4K Random R/W" "$DISK_RANDRW_IOPS_TOTAL" "$SCORE_DISK_IOPS"
+    printf "  %-20s %10s MB/s %10s\n" "Disk Seq Read" "$DISK_SEQ_READ_MB" "$SCORE_DISK_BW"
+    printf "  %-20s %10s MB/s %10s\n" "Disk Seq Write" "$DISK_SEQ_WRITE_MB" "-"
+    echo ""
+    echo "=========================================="
+    echo "TOTAL SCORE: $SCORE_TOTAL"
+    echo "=========================================="
+    echo ""
+    echo "JSON saved: $RESULT_JSON"
+    echo "Log file:   $LOG_FILE"
+    echo ""
+  } >> "$LOG_FILE" 2>/dev/null || true
 }
 
 upload_results() {
