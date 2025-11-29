@@ -41,6 +41,7 @@ NO_COLOR=false
 NO_UPLOAD=false
 FORCE_UPLOAD=false
 VERBOSE=false
+DEBUG=false
 QUIET=false
 JSON_ONLY=false
 NO_INSTALL=false
@@ -92,6 +93,7 @@ ${BOLD}OPTIONS:${NC}
     -V, --version       Show version number
     -q, --quiet         Minimal output
     -v, --verbose       Verbose output
+    --debug             Debug mode (shows all commands and system info)
     --json              Output JSON only (for scripting)
     --quick             Run quick benchmarks (~2 min instead of ~10 min)
     --no-color          Disable colored output
@@ -158,9 +160,32 @@ log_error() {
 }
 
 log_verbose() {
-  if [[ "$VERBOSE" == "true" ]]; then
+  if [[ "$VERBOSE" == "true" ]] || [[ "$DEBUG" == "true" ]]; then
+    echo -e "${DIM}[verbose]${NC} $*" >&2
+  fi
+}
+
+log_debug() {
+  if [[ "$DEBUG" == "true" ]]; then
     echo -e "${DIM}[debug]${NC} $*" >&2
   fi
+}
+
+debug_system_info() {
+  if [[ "$DEBUG" != "true" ]]; then
+    return
+  fi
+  echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━ DEBUG INFO ━━━━━━━━━━━━━━━━━━━━${NC}" >&2
+  echo -e "${DIM}Shell:${NC} $SHELL (BASH_VERSION: $BASH_VERSION)" >&2
+  echo -e "${DIM}User:${NC} $(whoami) (EUID: $EUID)" >&2
+  echo -e "${DIM}PWD:${NC} $(pwd)" >&2
+  echo -e "${DIM}PATH:${NC} $PATH" >&2
+  echo -e "${DIM}OS Release:${NC}" >&2
+  cat /etc/os-release 2>/dev/null | head -5 | sed 's/^/  /' >&2
+  echo -e "${DIM}Kernel:${NC} $(uname -a)" >&2
+  echo -e "${DIM}Disk Path:${NC} $DISK_PATH" >&2
+  echo -e "${DIM}Available space:${NC} $(df -h "$DISK_PATH" 2>/dev/null | tail -1)" >&2
+  echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
 }
 
 progress_bar() {
@@ -235,6 +260,12 @@ parse_args() {
         ;;
       -v|--verbose)
         VERBOSE=true
+        shift
+        ;;
+      --debug)
+        DEBUG=true
+        VERBOSE=true
+        set -x
         shift
         ;;
       --json)
@@ -365,13 +396,17 @@ require_cmd_or_install() {
   fi
 
   log "Installing $pkg..."
+  log_debug "Package manager: $PKG_MANAGER"
+  log_debug "Command to install: $cmd from package $pkg"
   
   case "$PKG_MANAGER" in
     apt)
+      log_debug "Running: apt-get update"
       if ! run_as_root apt-get update -qq 2>&1; then
         log_error "Failed to update apt cache"
         exit 1
       fi
+      log_debug "Running: apt-get install -y $pkg"
       if ! run_as_root apt-get install -y "$pkg" 2>&1 | grep -v "^Reading\|^Building\|^Processing"; then
         log_error "Failed to install $pkg"
         exit 1
@@ -955,6 +990,7 @@ main() {
   fi
   
   print_banner
+  debug_system_info
   
   check_dependencies
   collect_sysinfo

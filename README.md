@@ -49,6 +49,12 @@ curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/master/client/pr
 curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/master/client/proxmark.sh | bash -s -- --quick
 ```
 
+**Debug mode** (troubleshooting):
+
+```bash
+curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/master/client/proxmark.sh | bash -s -- --debug
+```
+
 ### Download and Inspect First
 
 If you prefer to review the script before running:
@@ -152,6 +158,7 @@ Options:
   -V, --version       Show version number
   -q, --quiet         Minimal output
   -v, --verbose       Verbose output
+  --debug             Debug mode (shows commands and system info)
   --json              Output JSON only (for scripting)
   --quick             Run quick benchmarks (~2 min instead of ~10 min)
   --no-color          Disable colored output
