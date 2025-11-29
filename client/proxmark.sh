@@ -13,7 +13,7 @@
 set -euo pipefail
 
 # === Version ===
-VERSION="1.0.6"
+VERSION="1.0.7"
 
 # === Colors ===
 RED='\033[0;31m'
@@ -564,9 +564,14 @@ collect_sysinfo() {
   MEM_TOTAL_MB=$((MEM_TOTAL_KB / 1024))
   MEM_TOTAL_GB=$((MEM_TOTAL_MB / 1024))
   
-  # Try to detect memory type and speed (best effort)
+  # Try to detect memory type, speed, and channel config (best effort)
   MEM_TYPE="unknown"
   MEM_SPEED=""
+  MEM_CHANNELS=""
+  MEM_SLOTS_USED=0
+  MEM_SLOTS_TOTAL=0
+  MEM_ECC=""
+  
   if command -v dmidecode >/dev/null 2>&1; then
     local dmi_out
     dmi_out=$(run_as_root dmidecode -t memory 2>/dev/null || echo "")
@@ -582,7 +587,39 @@ collect_sysinfo() {
         MEM_SPEED=$(echo "$dmi_out" | grep -E "^\s*Speed:" | grep -v "Unknown" | head -1 | awk '{print $2, $3}' || echo "")
       fi
       
-      log_verbose "Memory detection: type=$MEM_TYPE, speed=$MEM_SPEED"
+      # Check for ECC
+      local ecc_type=$(echo "$dmi_out" | grep -E "^\s*Error Correction Type:" | head -1 | awk '{print $4}' || echo "")
+      if [[ "$ecc_type" == "Single-bit" ]] || [[ "$ecc_type" == "Multi-bit" ]]; then
+        MEM_ECC="ECC"
+      elif [[ "$ecc_type" == "None" ]]; then
+        MEM_ECC="Non-ECC"
+      fi
+      
+      # Count memory slots and populated DIMMs
+      # Total slots = number of "Memory Device" sections
+      MEM_SLOTS_TOTAL=$(echo "$dmi_out" | grep -c "Memory Device" || echo 0)
+      # Populated = slots with actual size (not "No Module Installed")
+      MEM_SLOTS_USED=$(echo "$dmi_out" | grep -E "^\s*Size:" | grep -v "No Module" | grep -v "Unknown" | wc -l || echo 0)
+      
+      # Determine channel configuration based on populated slots
+      # This is a heuristic - actual channel config depends on motherboard
+      if [[ $MEM_SLOTS_USED -eq 1 ]]; then
+        MEM_CHANNELS="Single Channel"
+      elif [[ $MEM_SLOTS_USED -eq 2 ]]; then
+        MEM_CHANNELS="Dual Channel"
+      elif [[ $MEM_SLOTS_USED -eq 3 ]]; then
+        MEM_CHANNELS="Triple Channel"
+      elif [[ $MEM_SLOTS_USED -eq 4 ]]; then
+        MEM_CHANNELS="Quad Channel"
+      elif [[ $MEM_SLOTS_USED -eq 6 ]]; then
+        MEM_CHANNELS="Hexa Channel"
+      elif [[ $MEM_SLOTS_USED -eq 8 ]]; then
+        MEM_CHANNELS="Octa Channel"
+      elif [[ $MEM_SLOTS_USED -gt 8 ]]; then
+        MEM_CHANNELS="${MEM_SLOTS_USED}-DIMM"
+      fi
+      
+      log_verbose "Memory detection: type=$MEM_TYPE, speed=$MEM_SPEED, slots=${MEM_SLOTS_USED}/${MEM_SLOTS_TOTAL}, channels=$MEM_CHANNELS, ecc=$MEM_ECC"
     fi
   fi
   
@@ -598,8 +635,55 @@ collect_sysinfo() {
   
   # Proxmox detection - use pveversion command (preferred)
   PROXMOX_VERSION=""
+  PVE_NODE_NAME=""
+  PVE_CLUSTER_NAME=""
+  PVE_CLUSTER_NODES=0
+  PVE_SUBSCRIPTION=""
+  PVE_VM_COUNT=0
+  PVE_CT_COUNT=0
+  PVE_STORAGE_INFO=""
+  
   if command -v pveversion >/dev/null 2>&1; then
     PROXMOX_VERSION=$(pveversion 2>/dev/null | head -1 || echo "")
+    
+    # Get node name
+    PVE_NODE_NAME=$(hostname -s 2>/dev/null || hostname)
+    
+    # Cluster info
+    if command -v pvecm >/dev/null 2>&1; then
+      local cluster_status=$(pvecm status 2>/dev/null || echo "")
+      if [[ -n "$cluster_status" ]] && ! echo "$cluster_status" | grep -q "does not exist"; then
+        PVE_CLUSTER_NAME=$(echo "$cluster_status" | grep -m1 "Name:" | awk '{print $2}' || echo "")
+        PVE_CLUSTER_NODES=$(echo "$cluster_status" | grep -m1 "Nodes:" | awk '{print $2}' || echo 0)
+      fi
+    fi
+    
+    # Subscription status
+    if command -v pvesubscription >/dev/null 2>&1; then
+      local sub_status=$(pvesubscription get 2>/dev/null | grep -m1 "status" || echo "")
+      if echo "$sub_status" | grep -qi "active"; then
+        PVE_SUBSCRIPTION="active"
+      elif echo "$sub_status" | grep -qi "notfound"; then
+        PVE_SUBSCRIPTION="none"
+      else
+        PVE_SUBSCRIPTION="unknown"
+      fi
+    fi
+    
+    # Count VMs and containers
+    if command -v qm >/dev/null 2>&1; then
+      PVE_VM_COUNT=$(qm list 2>/dev/null | tail -n +2 | wc -l || echo 0)
+    fi
+    if command -v pct >/dev/null 2>&1; then
+      PVE_CT_COUNT=$(pct list 2>/dev/null | tail -n +2 | wc -l || echo 0)
+    fi
+    
+    # Storage info
+    if command -v pvesm >/dev/null 2>&1; then
+      PVE_STORAGE_INFO=$(pvesm status 2>/dev/null | tail -n +2 | awk '{printf "%s(%s) ", $1, $2}' || echo "")
+    fi
+    
+    log_verbose "Proxmox info: node=$PVE_NODE_NAME, cluster=$PVE_CLUSTER_NAME, nodes=$PVE_CLUSTER_NODES, VMs=$PVE_VM_COUNT, CTs=$PVE_CT_COUNT"
   fi
   
   # Disk info - detect the physical device underlying the mount
@@ -714,11 +798,22 @@ collect_sysinfo() {
     --argjson mem_mb "$MEM_TOTAL_MB" \
     --arg mem_type "$MEM_TYPE" \
     --arg mem_speed "${MEM_SPEED:-}" \
+    --arg mem_channels "${MEM_CHANNELS:-}" \
+    --argjson mem_slots_used "${MEM_SLOTS_USED:-0}" \
+    --argjson mem_slots_total "${MEM_SLOTS_TOTAL:-0}" \
+    --arg mem_ecc "${MEM_ECC:-}" \
     --arg kernel "$KERNEL" \
     --arg os "$OS" \
     --arg virt "$VIRT_TYPE" \
     --argjson is_proxmox "$([[ "${IS_PROXMOX:-false}" == "true" ]] && echo "true" || echo "false")" \
     --arg pve_version "$PROXMOX_VERSION" \
+    --arg pve_node "${PVE_NODE_NAME:-}" \
+    --arg pve_cluster "${PVE_CLUSTER_NAME:-}" \
+    --argjson pve_cluster_nodes "${PVE_CLUSTER_NODES:-0}" \
+    --arg pve_subscription "${PVE_SUBSCRIPTION:-}" \
+    --argjson pve_vm_count "${PVE_VM_COUNT:-0}" \
+    --argjson pve_ct_count "${PVE_CT_COUNT:-0}" \
+    --arg pve_storage "${PVE_STORAGE_INFO:-}" \
     --arg root_dev "$ROOT_DEV" \
     --arg disk_model "$DISK_MODEL" \
     --arg disk_type "$DISK_TYPE" \
@@ -732,14 +827,29 @@ collect_sysinfo() {
       cpu_sockets: $cpu_sockets,
       cpu_freq_base_mhz: $cpu_freq_base_mhz,
       cpu_freq_max_mhz: $cpu_freq_max_mhz,
-      mem_total_mb: $mem_mb,
-      mem_type: $mem_type,
-      mem_speed: $mem_speed,
+      memory: {
+        total_mb: $mem_mb,
+        type: $mem_type,
+        speed: $mem_speed,
+        channels: $mem_channels,
+        slots_used: $mem_slots_used,
+        slots_total: $mem_slots_total,
+        ecc: $mem_ecc
+      },
       kernel: $kernel,
       os: $os,
       virtualization: $virt,
       is_proxmox: $is_proxmox,
-      proxmox_version: $pve_version,
+      proxmox: {
+        version: $pve_version,
+        node_name: $pve_node,
+        cluster_name: $pve_cluster,
+        cluster_nodes: $pve_cluster_nodes,
+        subscription: $pve_subscription,
+        vm_count: $pve_vm_count,
+        ct_count: $pve_ct_count,
+        storage: $pve_storage
+      },
       root_device: $root_dev,
       disk_model: $disk_model,
       disk_type: $disk_type,
@@ -1135,7 +1245,18 @@ print_summary() {
   echo -e "  ${BOLD}Hostname:${NC}     $HOSTNAME"
   echo -e "  ${BOLD}OS:${NC}           $OS"
   echo -e "  ${BOLD}Kernel:${NC}       $KERNEL"
-  [[ -n "$PROXMOX_VERSION" ]] && echo -e "  ${BOLD}Proxmox:${NC}      $PROXMOX_VERSION"
+  if [[ -n "$PROXMOX_VERSION" ]]; then
+    echo -e "  ${BOLD}Proxmox:${NC}      $PROXMOX_VERSION"
+    if [[ -n "$PVE_CLUSTER_NAME" ]]; then
+      echo -e "  ${BOLD}Cluster:${NC}      $PVE_CLUSTER_NAME ($PVE_CLUSTER_NODES nodes)"
+    fi
+    if [[ $PVE_VM_COUNT -gt 0 ]] || [[ $PVE_CT_COUNT -gt 0 ]]; then
+      echo -e "  ${BOLD}Workloads:${NC}    $PVE_VM_COUNT VMs, $PVE_CT_COUNT containers"
+    fi
+    if [[ -n "$PVE_STORAGE_INFO" ]]; then
+      echo -e "  ${BOLD}Storage:${NC}      $PVE_STORAGE_INFO"
+    fi
+  fi
   echo
   
   # CPU info section
@@ -1157,8 +1278,13 @@ print_summary() {
   echo -e "${BOLD}${YELLOW}MEMORY${NC}"
   echo -e "${DIM}────────────────────────────────────────────────────────────────────────────${NC}"
   echo -e "  ${BOLD}Total:${NC}        ${mem_gb} GB (${MEM_TOTAL_MB} MB)"
-  [[ "$MEM_TYPE" != "unknown" && -n "$MEM_TYPE" ]] && echo -e "  ${BOLD}Type:${NC}         $MEM_TYPE"
+  if [[ "$MEM_TYPE" != "unknown" && -n "$MEM_TYPE" ]]; then
+    local mem_type_display="$MEM_TYPE"
+    [[ -n "$MEM_ECC" ]] && mem_type_display="$MEM_TYPE $MEM_ECC"
+    echo -e "  ${BOLD}Type:${NC}         $mem_type_display"
+  fi
   [[ -n "$MEM_SPEED" ]] && echo -e "  ${BOLD}Speed:${NC}        $MEM_SPEED"
+  [[ -n "$MEM_CHANNELS" ]] && echo -e "  ${BOLD}Config:${NC}       $MEM_CHANNELS (${MEM_SLOTS_USED}/${MEM_SLOTS_TOTAL} slots)"
   echo
   
   # Disk info section
@@ -1219,6 +1345,8 @@ print_summary() {
 write_summary_to_log() {
   local randrw_total_mb=$(awk "BEGIN {printf \"%.2f\", ${DISK_RANDRW_BW_R_MB:-0} + ${DISK_RANDRW_BW_W_MB:-0}}")
   
+  local randrw_total_mb=$(awk "BEGIN {printf \"%.2f\", ${DISK_RANDRW_BW_R_MB:-0} + ${DISK_RANDRW_BW_W_MB:-0}}")
+  
   {
     echo ""
     echo "=========================================="
@@ -1230,7 +1358,12 @@ write_summary_to_log() {
     echo "  Hostname:     $HOSTNAME"
     echo "  OS:           $OS"
     echo "  Kernel:       $KERNEL"
-    [[ -n "$PROXMOX_VERSION" ]] && echo "  Proxmox:      $PROXMOX_VERSION"
+    if [[ -n "$PROXMOX_VERSION" ]]; then
+      echo "  Proxmox:      $PROXMOX_VERSION"
+      [[ -n "$PVE_CLUSTER_NAME" ]] && echo "  Cluster:      $PVE_CLUSTER_NAME ($PVE_CLUSTER_NODES nodes)"
+      [[ $PVE_VM_COUNT -gt 0 || $PVE_CT_COUNT -gt 0 ]] && echo "  Workloads:    $PVE_VM_COUNT VMs, $PVE_CT_COUNT containers"
+      [[ -n "$PVE_STORAGE_INFO" ]] && echo "  Storage:      $PVE_STORAGE_INFO"
+    fi
     echo ""
     echo "CPU"
     echo "----------------------------------------"
@@ -1243,8 +1376,13 @@ write_summary_to_log() {
     echo "MEMORY"
     echo "----------------------------------------"
     echo "  Total:        $((MEM_TOTAL_MB / 1024)) GB (${MEM_TOTAL_MB} MB)"
-    [[ "$MEM_TYPE" != "unknown" && -n "$MEM_TYPE" ]] && echo "  Type:         $MEM_TYPE"
+    if [[ "$MEM_TYPE" != "unknown" && -n "$MEM_TYPE" ]]; then
+      local log_mem_type="$MEM_TYPE"
+      [[ -n "$MEM_ECC" ]] && log_mem_type="$MEM_TYPE $MEM_ECC"
+      echo "  Type:         $log_mem_type"
+    fi
     [[ -n "$MEM_SPEED" ]] && echo "  Speed:        $MEM_SPEED"
+    [[ -n "$MEM_CHANNELS" ]] && echo "  Config:       $MEM_CHANNELS (${MEM_SLOTS_USED}/${MEM_SLOTS_TOTAL} slots)"
     echo ""
     echo "STORAGE"
     echo "----------------------------------------"
@@ -1256,15 +1394,15 @@ write_summary_to_log() {
     echo ""
     echo "BENCHMARK RESULTS"
     echo "----------------------------------------"
-    printf "  %-20s %15s %10s\n" "Test" "Value" "Score"
-    echo "  ----------------------------------------"
-    printf "  %-20s %12s e/s %10s\n" "CPU Multi-thread" "$CPU_MULTI_EPS" "$SCORE_CPU_MULTI"
-    printf "  %-20s %12s e/s %10s\n" "CPU Single-thread" "$CPU_SINGLE_EPS" "$SCORE_CPU_SINGLE"
-    printf "  %-20s %10s MB/s %10s\n" "Memory Write" "$MEM_WRITE_MBS" "$SCORE_MEMORY"
-    printf "  %-20s %10s MB/s %10s\n" "Memory Read" "$MEM_READ_MBS" "-"
-    printf "  %-20s %10s IOPS %10s\n" "Disk 4K Random R/W" "$DISK_RANDRW_IOPS_TOTAL" "$SCORE_DISK_IOPS"
-    printf "  %-20s %10s MB/s %10s\n" "Disk Seq Read" "$DISK_SEQ_READ_MB" "$SCORE_DISK_BW"
-    printf "  %-20s %10s MB/s %10s\n" "Disk Seq Write" "$DISK_SEQ_WRITE_MB" "-"
+    printf "  %-22s %12s %12s %8s\n" "Test" "IOPS" "Throughput" "Score"
+    echo "  ----------------------------------------------------------------"
+    printf "  %-22s %12s %12s %8s\n" "CPU Multi-thread" "-" "${CPU_MULTI_EPS} e/s" "$SCORE_CPU_MULTI"
+    printf "  %-22s %12s %12s %8s\n" "CPU Single-thread" "-" "${CPU_SINGLE_EPS} e/s" "$SCORE_CPU_SINGLE"
+    printf "  %-22s %12s %12s %8s\n" "Memory Write" "-" "${MEM_WRITE_MBS} MB/s" "$SCORE_MEMORY"
+    printf "  %-22s %12s %12s %8s\n" "Memory Read" "-" "${MEM_READ_MBS} MB/s" "-"
+    printf "  %-22s %12s %12s %8s\n" "Disk 4K Random R/W" "$DISK_RANDRW_IOPS_TOTAL" "${randrw_total_mb} MB/s" "$SCORE_DISK_IOPS"
+    printf "  %-22s %12s %12s %8s\n" "Disk Seq Read" "${DISK_SEQ_READ_IOPS:-0}" "${DISK_SEQ_READ_MB} MB/s" "$SCORE_DISK_BW"
+    printf "  %-22s %12s %12s %8s\n" "Disk Seq Write" "${DISK_SEQ_WRITE_IOPS:-0}" "${DISK_SEQ_WRITE_MB} MB/s" "-"
     echo ""
     echo "=========================================="
     echo "TOTAL SCORE: $SCORE_TOTAL"
