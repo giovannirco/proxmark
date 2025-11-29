@@ -63,19 +63,18 @@ print_banner() {
   fi
   
   echo -e "${CYAN}"
-  cat << 'EOF'
-╭──────────────────────────────────────────────────────────────╮
-│                                                              │
-│    ██████╗ ██████╗  ██████╗ ██╗  ██╗███╗   ███╗ █████╗      │
-│    ██╔══██╗██╔══██╗██╔═══██╗╚██╗██╔╝████╗ ████║██╔══██╗     │
-│    ██████╔╝██████╔╝██║   ██║ ╚███╔╝ ██╔████╔██║███████║     │
-│    ██╔═══╝ ██╔══██╗██║   ██║ ██╔██╗ ██║╚██╔╝██║██╔══██║     │
-│    ██║     ██║  ██║╚██████╔╝██╔╝ ██╗██║ ╚═╝ ██║██║  ██║     │
-│    ╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝     │
-│                                                              │
-│              Proxmox VE Benchmark Suite                      │
-│                      v${VERSION}                                 │
-╰──────────────────────────────────────────────────────────────╯
+  cat << EOF
+╭─────────────────────────────────────────────────────────────────────────────╮
+│                                                                             │
+│  ██████╗ ██████╗  ██████╗ ██╗  ██╗███╗   ███╗ █████╗ ██████╗ ██╗  ██╗      │
+│  ██╔══██╗██╔══██╗██╔═══██╗╚██╗██╔╝████╗ ████║██╔══██╗██╔══██╗██║ ██╔╝      │
+│  ██████╔╝██████╔╝██║   ██║ ╚███╔╝ ██╔████╔██║███████║██████╔╝█████╔╝       │
+│  ██╔═══╝ ██╔══██╗██║   ██║ ██╔██╗ ██║╚██╔╝██║██╔══██║██╔══██╗██╔═██╗       │
+│  ██║     ██║  ██║╚██████╔╝██╔╝ ██╗██║ ╚═╝ ██║██║  ██║██║  ██║██║  ██╗      │
+│  ╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝      │
+│                                                                             │
+│                    Proxmox VE Benchmark Suite v${VERSION}                       │
+╰─────────────────────────────────────────────────────────────────────────────╯
 EOF
   echo -e "${NC}"
 }
@@ -342,6 +341,14 @@ detect_os() {
   log_verbose "Detected OS: $OS_PRETTY (ID: $OS_ID, pkg manager: $PKG_MANAGER)"
 }
 
+run_as_root() {
+  if [[ $EUID -eq 0 ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
 require_cmd_or_install() {
   local cmd="$1"
   local pkg="$2"
@@ -361,17 +368,23 @@ require_cmd_or_install() {
   
   case "$PKG_MANAGER" in
     apt)
-      sudo apt-get update -qq >/dev/null 2>&1
-      sudo apt-get install -y -qq "$pkg" >/dev/null 2>&1
+      if ! run_as_root apt-get update -qq 2>&1; then
+        log_error "Failed to update apt cache"
+        exit 1
+      fi
+      if ! run_as_root apt-get install -y "$pkg" 2>&1 | grep -v "^Reading\|^Building\|^Processing"; then
+        log_error "Failed to install $pkg"
+        exit 1
+      fi
       ;;
     dnf)
-      sudo dnf install -y -q "$pkg" >/dev/null 2>&1
+      run_as_root dnf install -y -q "$pkg" || { log_error "Failed to install $pkg"; exit 1; }
       ;;
     yum)
-      sudo yum install -y -q "$pkg" >/dev/null 2>&1
+      run_as_root yum install -y -q "$pkg" || { log_error "Failed to install $pkg"; exit 1; }
       ;;
     pacman)
-      sudo pacman -S --noconfirm --quiet "$pkg" >/dev/null 2>&1
+      run_as_root pacman -S --noconfirm "$pkg" || { log_error "Failed to install $pkg"; exit 1; }
       ;;
     *)
       log_error "Package manager not supported. Please install $pkg manually."
@@ -380,7 +393,7 @@ require_cmd_or_install() {
   esac
   
   if ! command -v "$cmd" >/dev/null 2>&1; then
-    log_error "Failed to install $pkg"
+    log_error "Failed to install $pkg - command '$cmd' still not found"
     exit 1
   fi
   
@@ -397,9 +410,9 @@ check_dependencies() {
   require_cmd_or_install jq jq
   
   # Check for libaio (needed for fio with libaio engine)
-  if [[ "$PKG_MANAGER" == "apt" ]] && ! dpkg -l | grep -q libaio; then
+  if [[ "$PKG_MANAGER" == "apt" ]] && ! dpkg -l 2>/dev/null | grep -q libaio; then
     log_verbose "Installing libaio-dev for fio..."
-    sudo apt-get install -y -qq libaio-dev >/dev/null 2>&1 || true
+    run_as_root apt-get install -y libaio-dev >/dev/null 2>&1 || true
   fi
   
   log_success "All dependencies satisfied"
@@ -427,7 +440,7 @@ collect_sysinfo() {
   # Try to detect memory type (best effort)
   MEM_TYPE="unknown"
   if command -v dmidecode >/dev/null 2>&1 && [[ -r /dev/mem ]]; then
-    MEM_TYPE=$(sudo dmidecode -t memory 2>/dev/null | grep -m1 "Type:" | awk '{print $2}' || echo "unknown")
+    MEM_TYPE=$(run_as_root dmidecode -t memory 2>/dev/null | grep -m1 "Type:" | awk '{print $2}' || echo "unknown")
   fi
   
   # Kernel and OS
