@@ -576,6 +576,9 @@ discover_storage_paths() {
 }
 
 prompt_additional_disks() {
+  # Initialize the array (even if we skip)
+  ADDITIONAL_DISK_PATHS=()
+  
   # If non-interactive or only one storage, skip
   if [[ "$INTERACTIVE" != "true" ]] || [[ ${#DISCOVERED_STORAGE[@]} -le 1 ]]; then
     return
@@ -822,15 +825,23 @@ collect_sysinfo() {
       local bank_desc="" bank_product="" bank_vendor="" bank_slot="" bank_size="" bank_clock=""
       
       while IFS= read -r line; do
-        if echo "$line" | grep -q "^\s*\*-bank"; then
-          # Save previous bank if exists
+        # Check for new section (bank, cache, memory, firmware)
+        if echo "$line" | grep -q "^\s*\*-"; then
+          # Save previous bank if exists and was valid
           if [[ "$in_bank" == true ]] && [[ -n "$bank_size" ]] && [[ "$bank_size" != "[empty]" ]]; then
             MEM_BANKS+=("$bank_slot|$bank_size|$bank_vendor|$bank_product|$bank_clock")
             MEM_SLOTS_USED=$((MEM_SLOTS_USED + 1))
           fi
-          in_bank=true
-          bank_desc="" bank_product="" bank_vendor="" bank_slot="" bank_size="" bank_clock=""
-          MEM_SLOTS_TOTAL=$((MEM_SLOTS_TOTAL + 1))
+          
+          # Check if this is a new bank section
+          if echo "$line" | grep -q "^\s*\*-bank"; then
+            in_bank=true
+            bank_desc="" bank_product="" bank_vendor="" bank_slot="" bank_size="" bank_clock=""
+            MEM_SLOTS_TOTAL=$((MEM_SLOTS_TOTAL + 1))
+          else
+            # Not a bank section (cache, firmware, etc.) - stop parsing as bank
+            in_bank=false
+          fi
         elif [[ "$in_bank" == true ]]; then
           if echo "$line" | grep -q "description:"; then
             bank_desc=$(echo "$line" | sed 's/.*description: //')
@@ -868,8 +879,8 @@ collect_sysinfo() {
         fi
       done <<< "$lshw_mem"
       
-      # Save last bank
-      if [[ "$in_bank" == true ]] && [[ -n "$bank_size" ]] && [[ "$bank_size" != "[empty]" ]]; then
+      # Save last bank if we ended while still in a bank section
+      if [[ "$in_bank" == true ]] && [[ -n "$bank_size" ]] && [[ "$bank_size" != "[empty]" ]] && [[ ! "$bank_slot" =~ [Cc]ache ]]; then
         MEM_BANKS+=("$bank_slot|$bank_size|$bank_vendor|$bank_product|$bank_clock")
         MEM_SLOTS_USED=$((MEM_SLOTS_USED + 1))
       fi
