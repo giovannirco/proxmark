@@ -59,7 +59,7 @@ proxmark/
 ### Testing Considerations
 
 When modifying the script:
-- It must work on Proxmox VE 7.x and 8.x
+- It must work on Proxmox VE 8.x and 9.x
 - It should be runnable from the web UI shell
 - Dependencies must be available in Proxmox/Debian repos
 - Don't assume specific hardware

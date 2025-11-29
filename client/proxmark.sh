@@ -13,7 +13,7 @@
 set -euo pipefail
 
 # === Version ===
-VERSION="1.0.3"
+VERSION="1.0.4"
 
 # === Colors ===
 RED='\033[0;31m'
@@ -31,7 +31,7 @@ CPU_SINGLE_TIME=${PROXMARK_CPU_SINGLE_TIME:-30}
 MEM_TIME=${PROXMARK_MEM_TIME:-30}
 DISK_RUNTIME=${PROXMARK_DISK_RUNTIME:-60}
 DISK_SIZE=${PROXMARK_DISK_SIZE:-1G}
-DISK_PATH="${PROXMARK_DISK_PATH:-/tmp}"
+DISK_PATH="${PROXMARK_DISK_PATH:-}"  # Empty = auto-detect
 API_URL="${PROXMARK_API_URL:-https://proxmark.io/api/v1}"
 RESULT_DIR="${PROXMARK_RESULT_DIR:-/tmp}"
 
@@ -45,6 +45,7 @@ DEBUG=false
 QUIET=false
 JSON_ONLY=false
 NO_INSTALL=false
+ALL_DISKS=false
 HELP=false
 SHOW_VERSION=false
 TAGS=""
@@ -102,7 +103,8 @@ ${BOLD}OPTIONS:${NC}
     --no-install        Don't auto-install missing dependencies
 
 ${BOLD}CONFIGURATION:${NC}
-    --disk-path PATH    Directory to use for disk benchmarks (default: /tmp)
+    --disk-path PATH    Directory to use for disk benchmarks (default: /var/lib/vz on Proxmox)
+    --all-disks         Benchmark all detected storage paths (coming soon)
     --output FILE       Custom output path for JSON results
     --tag TAG           Add a tag to results (can be used multiple times)
     --notes "TEXT"      Add notes to the benchmark result
@@ -115,17 +117,23 @@ ${BOLD}ENVIRONMENT VARIABLES:${NC}
     PROXMARK_API_URL     API server URL
 
 ${BOLD}EXAMPLES:${NC}
-    # Benchmark your VM storage
-    bash proxmark.sh --disk-path /var/lib/vz
+    # Standard benchmark (auto-detects /var/lib/vz on Proxmox)
+    bash proxmark.sh
 
     # Quick benchmark (~2 min)
     bash proxmark.sh --quick
+
+    # Benchmark specific path
+    bash proxmark.sh --disk-path /mnt/nvme-storage
 
     # Tag your Proxmox node
     bash proxmark.sh --tag "production" --tag "nvme" --notes "New node"
 
     # JSON output only
     bash proxmark.sh --json --no-upload
+
+    # Debug mode for troubleshooting
+    bash proxmark.sh --debug
 
 ${BOLD}MORE INFO:${NC}
     https://github.com/giovannirco/proxmark
@@ -304,6 +312,11 @@ parse_args() {
         DISK_PATH="$2"
         shift 2
         ;;
+      --all-disks)
+        ALL_DISKS=true
+        log_warning "--all-disks feature coming soon, benchmarking default path"
+        shift
+        ;;
       --output)
         CUSTOM_OUTPUT="$2"
         shift 2
@@ -446,15 +459,20 @@ check_proxmox() {
     log_warning "Results may not be accurate on non-Proxmox systems"
   fi
   
-  # Auto-detect best disk path for Proxmox
-  if [[ "$DISK_PATH" == "/tmp" ]] && [[ "$IS_PROXMOX" == "true" ]]; then
-    if [[ -d /var/lib/vz ]]; then
+  # Auto-detect best disk path
+  if [[ -z "$DISK_PATH" ]]; then
+    if [[ "$IS_PROXMOX" == "true" ]] && [[ -d /var/lib/vz ]]; then
       # Check if /var/lib/vz is a real storage (not just tmpfs)
       local vz_fs=$(df /var/lib/vz 2>/dev/null | awk 'NR==2 {print $1}')
       if [[ "$vz_fs" != "tmpfs" ]] && [[ -n "$vz_fs" ]]; then
         DISK_PATH="/var/lib/vz"
-        log_verbose "Auto-detected Proxmox storage: $DISK_PATH"
+        log "Auto-detected Proxmox storage: $DISK_PATH"
+      else
+        DISK_PATH="/tmp"
+        log_warning "Could not detect Proxmox storage, using /tmp"
       fi
+    else
+      DISK_PATH="/tmp"
     fi
   fi
 }
@@ -492,13 +510,29 @@ collect_sysinfo() {
   CPU_SOCKETS="$(grep 'physical id' /proc/cpuinfo | sort -u | wc -l)"
   [[ "$CPU_SOCKETS" -eq 0 ]] && CPU_SOCKETS=1
   
-  # CPU frequency detection
-  CPU_FREQ_MHZ=""
+  # CPU frequency detection (base and max/boost)
+  CPU_FREQ_BASE_MHZ=""
+  CPU_FREQ_MAX_MHZ=""
+  
+  # Try to get base frequency from cpufreq
+  if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/base_frequency ]]; then
+    local base_khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/base_frequency 2>/dev/null || echo 0)
+    CPU_FREQ_BASE_MHZ=$((base_khz / 1000))
+  elif [[ -f /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq ]]; then
+    # Fallback: use min freq as approximation (not always accurate)
+    local min_khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq 2>/dev/null || echo 0)
+    # Only use if it's reasonable (> 800 MHz)
+    if [[ $min_khz -gt 800000 ]]; then
+      CPU_FREQ_BASE_MHZ=$((min_khz / 1000))
+    fi
+  fi
+  
+  # Get max/boost frequency
   if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq ]]; then
-    local freq_khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null || echo 0)
-    CPU_FREQ_MHZ=$((freq_khz / 1000))
+    local max_khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null || echo 0)
+    CPU_FREQ_MAX_MHZ=$((max_khz / 1000))
   elif grep -q "cpu MHz" /proc/cpuinfo; then
-    CPU_FREQ_MHZ=$(grep -m1 "cpu MHz" /proc/cpuinfo | awk '{printf "%.0f", $4}')
+    CPU_FREQ_MAX_MHZ=$(grep -m1 "cpu MHz" /proc/cpuinfo | awk '{printf "%.0f", $4}')
   fi
   
   # Memory info
@@ -578,7 +612,8 @@ collect_sysinfo() {
     --argjson cpu_cores "$CPU_CORES" \
     --argjson cpu_threads "$CPU_THREADS" \
     --argjson cpu_sockets "$CPU_SOCKETS" \
-    --arg cpu_freq_mhz "${CPU_FREQ_MHZ:-}" \
+    --arg cpu_freq_base_mhz "${CPU_FREQ_BASE_MHZ:-}" \
+    --arg cpu_freq_max_mhz "${CPU_FREQ_MAX_MHZ:-}" \
     --argjson mem_mb "$MEM_TOTAL_MB" \
     --arg mem_type "$MEM_TYPE" \
     --arg mem_speed "${MEM_SPEED:-}" \
@@ -598,7 +633,8 @@ collect_sysinfo() {
       cpu_cores: $cpu_cores,
       cpu_threads: $cpu_threads,
       cpu_sockets: $cpu_sockets,
-      cpu_freq_mhz: $cpu_freq_mhz,
+      cpu_freq_base_mhz: $cpu_freq_base_mhz,
+      cpu_freq_max_mhz: $cpu_freq_max_mhz,
       mem_total_mb: $mem_mb,
       mem_type: $mem_type,
       mem_speed: $mem_speed,
@@ -1011,7 +1047,12 @@ print_summary() {
   echo -e "  ${BOLD}Model:${NC}        $CPU_MODEL"
   echo -e "  ${BOLD}Cores:${NC}        $CPU_CORES cores / $CPU_THREADS threads"
   echo -e "  ${BOLD}Sockets:${NC}      $CPU_SOCKETS"
-  [[ -n "$CPU_FREQ_MHZ" && "$CPU_FREQ_MHZ" != "0" ]] && echo -e "  ${BOLD}Max Freq:${NC}     ${CPU_FREQ_MHZ} MHz"
+  if [[ -n "$CPU_FREQ_BASE_MHZ" && "$CPU_FREQ_BASE_MHZ" != "0" ]]; then
+    echo -e "  ${BOLD}Base Freq:${NC}    ${CPU_FREQ_BASE_MHZ} MHz"
+  fi
+  if [[ -n "$CPU_FREQ_MAX_MHZ" && "$CPU_FREQ_MAX_MHZ" != "0" ]]; then
+    echo -e "  ${BOLD}Max Freq:${NC}     ${CPU_FREQ_MAX_MHZ} MHz"
+  fi
   echo
   
   # Memory info section
@@ -1040,19 +1081,23 @@ print_summary() {
   echo -e "${BOLD}${YELLOW}BENCHMARK RESULTS${NC}"
   echo -e "${DIM}────────────────────────────────────────────────────────────────────────────${NC}"
   echo
-  echo -e "${DIM}┌────────────┬────────────────────────┬──────────────┬─────────┐${NC}"
-  echo -e "${DIM}│${NC}${BOLD} Component  ${DIM}│${NC}${BOLD} Metric                 ${DIM}│${NC}${BOLD} Value        ${DIM}│${NC}${BOLD} Score   ${DIM}│${NC}"
-  echo -e "${DIM}├────────────┼────────────────────────┼──────────────┼─────────┤${NC}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-22s ${DIM}│${NC} %12s ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "CPU" "Multi-thread (ev/s)" "${CPU_MULTI_EPS}" "${SCORE_CPU_MULTI}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-22s ${DIM}│${NC} %12s ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "CPU" "Single-thread (ev/s)" "${CPU_SINGLE_EPS}" "${SCORE_CPU_SINGLE}"
-  echo -e "${DIM}├────────────┼────────────────────────┼──────────────┼─────────┤${NC}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-22s ${DIM}│${NC} %12s ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "Memory" "Write (MB/s)" "${MEM_WRITE_MBS}" "${SCORE_MEMORY}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-22s ${DIM}│${NC} %12s ${DIM}│${NC}         ${DIM}│${NC}\n" "Memory" "Read (MB/s)" "${MEM_READ_MBS}"
-  echo -e "${DIM}├────────────┼────────────────────────┼──────────────┼─────────┤${NC}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-22s ${DIM}│${NC} %12s ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "Disk" "4K Random R/W (IOPS)" "${DISK_RANDRW_IOPS_TOTAL}" "${SCORE_DISK_IOPS}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-22s ${DIM}│${NC} %12s ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "Disk" "Seq Read (MB/s)" "${DISK_SEQ_READ_MB}" "${SCORE_DISK_BW}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-22s ${DIM}│${NC} %12s ${DIM}│${NC}         ${DIM}│${NC}\n" "Disk" "Seq Write (MB/s)" "${DISK_SEQ_WRITE_MB}"
-  echo -e "${DIM}└────────────┴────────────────────────┴──────────────┴─────────┘${NC}"
+  
+  # Calculate combined MB/s for random r/w
+  local randrw_total_mb=$(awk "BEGIN {printf \"%.2f\", ${DISK_RANDRW_BW_R_MB:-0} + ${DISK_RANDRW_BW_W_MB:-0}}")
+  
+  echo -e "${DIM}┌────────────┬─────────────────────┬──────────────┬──────────────┬─────────┐${NC}"
+  echo -e "${DIM}│${NC}${BOLD} Component  ${DIM}│${NC}${BOLD} Test                ${DIM}│${NC}${BOLD} IOPS         ${DIM}│${NC}${BOLD} Throughput   ${DIM}│${NC}${BOLD} Score   ${DIM}│${NC}"
+  echo -e "${DIM}├────────────┼─────────────────────┼──────────────┼──────────────┼─────────┤${NC}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "CPU" "Multi-thread" "${CPU_MULTI_EPS} e/s" "${SCORE_CPU_MULTI}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "CPU" "Single-thread" "${CPU_SINGLE_EPS} e/s" "${SCORE_CPU_SINGLE}"
+  echo -e "${DIM}├────────────┼─────────────────────┼──────────────┼──────────────┼─────────┤${NC}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "Memory" "Write" "${MEM_WRITE_MBS} MB/s" "${SCORE_MEMORY}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC}         ${DIM}│${NC}\n" "Memory" "Read" "${MEM_READ_MBS} MB/s"
+  echo -e "${DIM}├────────────┼─────────────────────┼──────────────┼──────────────┼─────────┤${NC}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC} %12s ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "Disk" "4K Random R/W" "${DISK_RANDRW_IOPS_TOTAL}" "${randrw_total_mb} MB/s" "${SCORE_DISK_IOPS}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC} %12s ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "Disk" "Sequential Read" "${DISK_SEQ_READ_IOPS:-0}" "${DISK_SEQ_READ_MB} MB/s" "${SCORE_DISK_BW}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC} %12s ${DIM}│${NC} %10s   ${DIM}│${NC}         ${DIM}│${NC}\n" "Disk" "Sequential Write" "${DISK_SEQ_WRITE_IOPS:-0}" "${DISK_SEQ_WRITE_MB} MB/s"
+  echo -e "${DIM}└────────────┴─────────────────────┴──────────────┴──────────────┴─────────┘${NC}"
   echo
   
   # Total score - make it stand out

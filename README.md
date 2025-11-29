@@ -34,35 +34,37 @@ Perfect for:
 Open the shell from your Proxmox web UI (Node → Shell) or SSH into your node and run:
 
 ```bash
-curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/v1.0.0/client/proxmark.sh | bash
+curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/v1.0.4/client/proxmark.sh | bash
 ```
 
-**With options** (benchmark your VM storage):
-
-```bash
-curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/v1.0.0/client/proxmark.sh | bash -s -- --disk-path /var/lib/vz
-```
+The script auto-detects Proxmox and benchmarks `/var/lib/vz` (your VM storage) by default.
 
 **Quick mode** (~2 minutes):
 
 ```bash
-curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/v1.0.0/client/proxmark.sh | bash -s -- --quick
+curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/v1.0.4/client/proxmark.sh | bash -s -- --quick
+```
+
+**Custom storage path**:
+
+```bash
+curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/v1.0.4/client/proxmark.sh | bash -s -- --disk-path /mnt/nvme-storage
 ```
 
 **Debug mode** (troubleshooting):
 
 ```bash
-curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/v1.0.0/client/proxmark.sh | bash -s -- --debug
+curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/v1.0.4/client/proxmark.sh | bash -s -- --debug
 ```
 
-> **Tip**: Replace `v1.0.0` with `master` to always get the latest development version.
+> **Tip**: Replace `v1.0.4` with `master` to always get the latest development version.
 
 ### Download and Inspect First
 
 If you prefer to review the script before running:
 
 ```bash
-curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/v1.0.0/client/proxmark.sh -o proxmark.sh
+curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/v1.0.4/client/proxmark.sh -o proxmark.sh
 less proxmark.sh
 bash proxmark.sh
 ```
@@ -118,18 +120,20 @@ From the Proxmox shell:
 bash proxmark.sh
 ```
 
+The script auto-detects `/var/lib/vz` on Proxmox systems. If running on non-Proxmox, it defaults to `/tmp`.
+
 ### Quick Mode (~2 minutes)
 
 ```bash
 bash proxmark.sh --quick
 ```
 
-### Benchmark Your VM Storage
+### Benchmark Custom Storage Path
 
-Test the actual storage where your VMs live:
+Test a specific storage path:
 
 ```bash
-bash proxmark.sh --disk-path /var/lib/vz
+bash proxmark.sh --disk-path /mnt/nvme-storage
 ```
 
 Or a specific storage mount:
@@ -169,7 +173,8 @@ Options:
   --no-install        Don't auto-install missing dependencies
 
 Configuration:
-  --disk-path PATH    Directory for disk benchmarks (default: /tmp)
+  --disk-path PATH    Directory for disk benchmarks (default: /var/lib/vz on Proxmox)
+  --all-disks         Benchmark all detected storage paths (coming soon)
   --output FILE       Custom output path for JSON results
   --tag TAG           Add a tag to results (can use multiple times)
   --notes "TEXT"      Add notes to the benchmark result
