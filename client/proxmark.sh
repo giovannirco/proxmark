@@ -675,10 +675,26 @@ collect_sysinfo() {
   
   # CPU info from /proc/cpuinfo (basic)
   CPU_MODEL="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//' || echo 'Unknown')"
-  CPU_CORES="$(nproc --all)"
-  CPU_THREADS="$(grep -c ^processor /proc/cpuinfo 2>/dev/null || echo "$CPU_CORES")"
+  
+  # Get physical cores (not threads)
+  # "cpu cores" in /proc/cpuinfo shows cores per socket
+  local cores_per_socket=$(grep -m1 "cpu cores" /proc/cpuinfo | cut -d: -f2 | tr -d ' ' || echo "")
   CPU_SOCKETS="$(grep 'physical id' /proc/cpuinfo | sort -u | wc -l)"
   [[ "$CPU_SOCKETS" -eq 0 ]] && CPU_SOCKETS=1
+  
+  if [[ -n "$cores_per_socket" && "$cores_per_socket" -gt 0 ]]; then
+    CPU_CORES=$((cores_per_socket * CPU_SOCKETS))
+  else
+    # Fallback: try lscpu
+    CPU_CORES=$(lscpu 2>/dev/null | grep "^Core(s) per socket:" | awk '{print $NF}')
+    [[ -n "$CPU_CORES" ]] && CPU_CORES=$((CPU_CORES * CPU_SOCKETS))
+  fi
+  
+  # Total logical processors (threads)
+  CPU_THREADS="$(nproc --all 2>/dev/null || grep -c ^processor /proc/cpuinfo)"
+  
+  # Fallback if cores detection failed
+  [[ -z "$CPU_CORES" || "$CPU_CORES" -eq 0 ]] && CPU_CORES="$CPU_THREADS"
   
   # Additional CPU info
   CPU_VENDOR=""
@@ -771,6 +787,29 @@ collect_sysinfo() {
     local model_freq=$(echo "$CPU_MODEL" | grep -oE '@[[:space:]]*[0-9]+\.[0-9]+GHz' | grep -oE '[0-9]+\.[0-9]+')
     if [[ -n "$model_freq" ]]; then
       CPU_FREQ_BASE_MHZ=$(awk "BEGIN {printf \"%.0f\", $model_freq * 1000}")
+    fi
+  fi
+  
+  # Try lscpu for base frequency (works on some systems)
+  if [[ -z "$CPU_FREQ_BASE_MHZ" || "$CPU_FREQ_BASE_MHZ" == "0" ]]; then
+    # lscpu shows "CPU base MHz" on some systems
+    local lscpu_base=$(lscpu 2>/dev/null | grep -i "CPU base MHz" | awk -F: '{print $2}' | tr -d ' ' | cut -d. -f1)
+    if [[ -n "$lscpu_base" && "$lscpu_base" -gt 0 ]]; then
+      CPU_FREQ_BASE_MHZ="$lscpu_base"
+    fi
+  fi
+  
+  # For AMD: try reading from /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_frequencies
+  # and pick a sensible base (often the second-highest value)
+  if [[ -z "$CPU_FREQ_BASE_MHZ" || "$CPU_FREQ_BASE_MHZ" == "0" ]]; then
+    if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_frequencies ]]; then
+      # Get all frequencies, sort descending, pick second one as "base"
+      local freqs=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_frequencies 2>/dev/null | tr ' ' '\n' | sort -rn | head -5)
+      # Skip the boost frequency, use the second highest as base approximation
+      local base_khz=$(echo "$freqs" | sed -n '2p')
+      if [[ -n "$base_khz" && "$base_khz" -gt 1000000 ]]; then
+        CPU_FREQ_BASE_MHZ=$((base_khz / 1000))
+      fi
     fi
   fi
   
