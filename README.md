@@ -5,7 +5,7 @@
 **Fast benchmarking for Proxmox VE nodes**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Proxmox VE](https://img.shields.io/badge/Proxmox%20VE-7.x%20%7C%208.x-orange.svg)](https://www.proxmox.com/)
+[![Proxmox VE](https://img.shields.io/badge/Proxmox%20VE-8.x%20%7C%209.x-orange.svg)](https://www.proxmox.com/)
 
 [Getting Started](#getting-started) •
 [Features](#features) •
@@ -29,23 +29,37 @@ Perfect for:
 
 ## Getting Started
 
-### Run from Proxmox Shell
+### One-Liner from Proxmox Shell
 
-Open the shell from your Proxmox web UI (or SSH into your node) and run:
+Open the shell from your Proxmox web UI (Node → Shell) or SSH into your node and run:
 
 ```bash
-curl -sL https://proxmark.io/run | bash
+curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/master/client/proxmark.sh | bash
 ```
 
-Or download and inspect before running:
+**With options** (benchmark your VM storage):
 
 ```bash
-curl -sL https://proxmark.io/run -o proxmark.sh
+curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/master/client/proxmark.sh | bash -s -- --disk-path /var/lib/vz
+```
+
+**Quick mode** (~2 minutes):
+
+```bash
+curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/master/client/proxmark.sh | bash -s -- --quick
+```
+
+### Download and Inspect First
+
+If you prefer to review the script before running:
+
+```bash
+curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/master/client/proxmark.sh -o proxmark.sh
 less proxmark.sh
 bash proxmark.sh
 ```
 
-### Clone and Run
+### Clone Repository
 
 ```bash
 git clone https://github.com/giovannirco/proxmark.git
@@ -55,7 +69,7 @@ bash client/proxmark.sh
 
 ### Requirements
 
-- **Proxmox VE 7.x or 8.x** (runs directly on the host, not inside a VM/container)
+- **Proxmox VE 8.x or 9.x** (runs directly on the host, not inside a VM/container)
 - Root access (you're already root in the Proxmox shell)
 - ~2GB free disk space for benchmark test files
 
