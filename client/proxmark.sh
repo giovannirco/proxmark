@@ -345,7 +345,6 @@ parse_args() {
         ;;
       --all-disks)
         ALL_DISKS=true
-        log_warning "--all-disks feature coming soon, benchmarking default path"
         shift
         ;;
       --output)
@@ -1056,10 +1055,27 @@ run_mem_benchmark() {
     --time="$lat_time" \
     --threads=1 run 2>&1)"
   
-  # Extract latency from sysbench output (avg latency in ms, convert to ns)
-  local lat_avg_ms=$(echo "$out" | awk '/avg:/ {print $2}' | head -1 || echo "0")
-  MEM_LATENCY_NS=$(awk "BEGIN {printf \"%.0f\", $lat_avg_ms * 1000000}")
+  # Extract latency from sysbench output
+  # Format is: "avg:                                    X.XX"
+  local lat_avg_ms=$(echo "$out" | grep -A1 "Latency (ms)" | grep "avg:" | awk '{print $NF}' || echo "0")
+  
+  # If that didn't work, try alternative parsing
+  if [[ -z "$lat_avg_ms" || "$lat_avg_ms" == "0" ]]; then
+    lat_avg_ms=$(echo "$out" | awk '/avg:/{gsub(/[^0-9.]/,"",$NF); print $NF}' | head -1 || echo "0")
+  fi
+  
+  # Calculate operations per second for latency estimation
+  # If sysbench latency is too low to measure, estimate from ops/sec
+  if [[ "$lat_avg_ms" == "0" || "$lat_avg_ms" == "0.00" ]]; then
+    local ops_per_sec=$(echo "$out" | awk '/Total operations:.*per second/ {gsub(/[()]/,"",$NF); print $(NF-1)}' || echo "0")
+    if [[ -n "$ops_per_sec" ]] && [[ "$ops_per_sec" != "0" ]]; then
+      # Latency in microseconds = 1,000,000 / ops_per_sec
+      lat_avg_ms=$(awk "BEGIN {printf \"%.4f\", 1000 / $ops_per_sec}")
+    fi
+  fi
+  
   MEM_LATENCY_MS="$lat_avg_ms"
+  MEM_LATENCY_NS=$(awk "BEGIN {printf \"%.0f\", $lat_avg_ms * 1000000}")
   
   log_success "Memory latency: ${lat_avg_ms} ms avg"
 }
