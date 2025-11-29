@@ -841,25 +841,6 @@ collect_sysinfo() {
     fi
   fi
   
-  # AMD Ryzen: try to get nominal frequency from amd_pstate driver
-  if [[ -z "$CPU_FREQ_BASE_MHZ" || "$CPU_FREQ_BASE_MHZ" == "0" ]]; then
-    if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/amd_pstate_highest_perf ]]; then
-      # amd_pstate driver exposes performance levels, nominal is documented elsewhere
-      # For now, estimate base as ~70% of max for typical Ryzen
-      if [[ -n "$CPU_FREQ_MAX_MHZ" && "$CPU_FREQ_MAX_MHZ" -gt 0 ]]; then
-        CPU_FREQ_BASE_MHZ=$(awk "BEGIN {printf \"%.0f\", $CPU_FREQ_MAX_MHZ * 0.71}")
-      fi
-    fi
-  fi
-  
-  # Generic AMD fallback: if vendor is AMD and we have max but no base
-  # estimate base as ~71% of boost (common Ryzen pattern: 3.1GHz base / 4.35GHz boost ≈ 71%)
-  if [[ -z "$CPU_FREQ_BASE_MHZ" || "$CPU_FREQ_BASE_MHZ" == "0" ]]; then
-    if [[ "$CPU_VENDOR" == "AMD" || "$CPU_VENDOR" == "Advanced Micro Devices" ]] && [[ -n "$CPU_FREQ_MAX_MHZ" && "$CPU_FREQ_MAX_MHZ" -gt 0 ]]; then
-      # Round to nearest 100 MHz for cleaner display
-      CPU_FREQ_BASE_MHZ=$(awk "BEGIN {printf \"%.0f\", int($CPU_FREQ_MAX_MHZ * 0.71 / 100 + 0.5) * 100}")
-    fi
-  fi
   
   # Get max/boost frequency if not already set
   if [[ -z "$CPU_FREQ_MAX_MHZ" || "$CPU_FREQ_MAX_MHZ" == "0" ]]; then
