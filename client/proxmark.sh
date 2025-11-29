@@ -13,7 +13,7 @@
 set -euo pipefail
 
 # === Version ===
-VERSION="1.0.1"
+VERSION="1.0.2"
 
 # === Colors ===
 RED='\033[0;31m'
@@ -513,11 +513,9 @@ collect_sysinfo() {
     VIRT_TYPE=$(systemd-detect-virt 2>/dev/null || echo "bare-metal")
   fi
   
-  # Proxmox detection
+  # Proxmox detection - use pveversion command (preferred)
   PROXMOX_VERSION=""
-  if [[ -f /etc/pve/.version ]]; then
-    PROXMOX_VERSION=$(cat /etc/pve/.version 2>/dev/null || echo "")
-  elif command -v pveversion >/dev/null 2>&1; then
+  if command -v pveversion >/dev/null 2>&1; then
     PROXMOX_VERSION=$(pveversion 2>/dev/null | head -1 || echo "")
   fi
   
@@ -674,9 +672,14 @@ run_disk_benchmark() {
   
   # Check if benchmarking tmpfs (RAM disk) - warn user
   local disk_fs=$(df "$DISK_PATH" 2>/dev/null | awk 'NR==2 {print $1}')
+  local is_tmpfs=false
   if [[ "$disk_fs" == "tmpfs" ]]; then
-    log_warning "Disk path '$DISK_PATH' is tmpfs (RAM disk) - results won't reflect actual storage performance"
-    log_warning "Use --disk-path /var/lib/vz to benchmark your VM storage"
+    is_tmpfs=true
+    log_warning "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_warning "Disk path '$DISK_PATH' is tmpfs (RAM disk)"
+    log_warning "Disk results will measure RAM speed, not actual storage!"
+    log_warning "For accurate results, use: --disk-path /var/lib/vz"
+    log_warning "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   fi
   
   # Check disk space
@@ -687,26 +690,41 @@ run_disk_benchmark() {
     DISK_SIZE="256M"
   fi
   
-  # Determine I/O engine
+  # Determine I/O engine - use sync for tmpfs (libaio may not work)
   local ioengine="libaio"
-  if ! modprobe -n libaio 2>/dev/null && [[ ! -e /lib/modules/$(uname -r)/kernel/fs/aio.ko ]]; then
+  if [[ "$is_tmpfs" == "true" ]]; then
+    ioengine="sync"
+    log_verbose "Using sync engine for tmpfs"
+  elif ! modprobe -n libaio 2>/dev/null && [[ ! -e /lib/modules/$(uname -r)/kernel/fs/aio.ko ]]; then
     ioengine="sync"
     log_verbose "libaio not available, falling back to sync engine"
   fi
   
   # Random read/write test
   local out
+  local fio_err=""
+  
+  # Set iodepth based on engine (sync doesn't support high iodepth)
+  local iodepth=32
+  if [[ "$ioengine" == "sync" ]]; then
+    iodepth=1
+  fi
+  
+  log_debug "Running fio with engine=$ioengine, iodepth=$iodepth, file=$filename"
+  
   out="$(fio --name=proxmark-randrw \
     --filename="$filename" \
     --rw=randrw \
     --bs=4k \
-    --iodepth=32 \
+    --iodepth="$iodepth" \
     --size="$DISK_SIZE" \
     --time_based \
     --runtime="$DISK_RUNTIME" \
     --group_reporting \
     --ioengine="$ioengine" \
-    --output-format=json 2>/dev/null)" || out=""
+    --output-format=json 2>&1)" || fio_err="$?"
+  
+  log_debug "fio exit code: ${fio_err:-0}"
   
   # Parse JSON output if available
   if echo "$out" | jq -e '.jobs[0]' >/dev/null 2>&1; then
@@ -719,9 +737,10 @@ run_disk_benchmark() {
     DISK_RANDRW_BW_W_MB=$(awk "BEGIN {printf \"%.2f\", $DISK_RANDRW_BW_W/1024/1024}")
     DISK_RANDRW_LAT_AVG=$(echo "$out" | jq -r '.jobs[0].read.lat_ns.mean // 0')
     DISK_RANDRW_LAT_AVG_US=$(awk "BEGIN {printf \"%.0f\", $DISK_RANDRW_LAT_AVG/1000}")
+    log_debug "Parsed IOPS: read=$DISK_RANDRW_IOPS_R, write=$DISK_RANDRW_IOPS_W"
   else
-    # Fallback to text parsing
-    log_verbose "Falling back to text parsing for fio output"
+    log_verbose "fio output parsing failed, output was:"
+    log_verbose "$out"
     DISK_RANDRW_IOPS_R=0
     DISK_RANDRW_IOPS_W=0
     DISK_RANDRW_IOPS_TOTAL=0
@@ -735,23 +754,30 @@ run_disk_benchmark() {
   # Sequential read test
   log "Running Disk benchmark (sequential read, ${DISK_RUNTIME}s)..."
   
+  # Set iodepth for sequential tests
+  local seq_iodepth=16
+  if [[ "$ioengine" == "sync" ]]; then
+    seq_iodepth=1
+  fi
+  
   out="$(fio --name=proxmark-seqread \
     --filename="$filename" \
     --rw=read \
     --bs=1M \
-    --iodepth=16 \
+    --iodepth="$seq_iodepth" \
     --size="$DISK_SIZE" \
     --time_based \
     --runtime="$DISK_RUNTIME" \
     --group_reporting \
     --ioengine="$ioengine" \
-    --output-format=json 2>/dev/null)" || out=""
+    --output-format=json 2>&1)" || true
   
   if echo "$out" | jq -e '.jobs[0]' >/dev/null 2>&1; then
     DISK_SEQ_READ_IOPS=$(echo "$out" | jq -r '.jobs[0].read.iops // 0' | cut -d. -f1)
     local bw_bytes=$(echo "$out" | jq -r '.jobs[0].read.bw_bytes // 0')
     DISK_SEQ_READ_MB=$(awk "BEGIN {printf \"%.2f\", $bw_bytes/1024/1024}")
   else
+    log_verbose "Sequential read fio parsing failed"
     DISK_SEQ_READ_IOPS=0
     DISK_SEQ_READ_MB="0"
   fi
@@ -765,19 +791,20 @@ run_disk_benchmark() {
     --filename="$filename" \
     --rw=write \
     --bs=1M \
-    --iodepth=16 \
+    --iodepth="$seq_iodepth" \
     --size="$DISK_SIZE" \
     --time_based \
     --runtime="$DISK_RUNTIME" \
     --group_reporting \
     --ioengine="$ioengine" \
-    --output-format=json 2>/dev/null)" || out=""
+    --output-format=json 2>&1)" || true
   
   if echo "$out" | jq -e '.jobs[0]' >/dev/null 2>&1; then
     DISK_SEQ_WRITE_IOPS=$(echo "$out" | jq -r '.jobs[0].write.iops // 0' | cut -d. -f1)
     local bw_bytes=$(echo "$out" | jq -r '.jobs[0].write.bw_bytes // 0')
     DISK_SEQ_WRITE_MB=$(awk "BEGIN {printf \"%.2f\", $bw_bytes/1024/1024}")
   else
+    log_verbose "Sequential write fio parsing failed"
     DISK_SEQ_WRITE_IOPS=0
     DISK_SEQ_WRITE_MB="0"
   fi
