@@ -826,11 +826,11 @@ collect_sysinfo() {
           # Save previous bank if exists
           if [[ "$in_bank" == true ]] && [[ -n "$bank_size" ]] && [[ "$bank_size" != "[empty]" ]]; then
             MEM_BANKS+=("$bank_slot|$bank_size|$bank_vendor|$bank_product|$bank_clock")
-            ((MEM_SLOTS_USED++))
+            MEM_SLOTS_USED=$((MEM_SLOTS_USED + 1))
           fi
           in_bank=true
           bank_desc="" bank_product="" bank_vendor="" bank_slot="" bank_size="" bank_clock=""
-          ((MEM_SLOTS_TOTAL++))
+          MEM_SLOTS_TOTAL=$((MEM_SLOTS_TOTAL + 1))
         elif [[ "$in_bank" == true ]]; then
           if echo "$line" | grep -q "description:"; then
             bank_desc=$(echo "$line" | sed 's/.*description: //')
@@ -871,7 +871,7 @@ collect_sysinfo() {
       # Save last bank
       if [[ "$in_bank" == true ]] && [[ -n "$bank_size" ]] && [[ "$bank_size" != "[empty]" ]]; then
         MEM_BANKS+=("$bank_slot|$bank_size|$bank_vendor|$bank_product|$bank_clock")
-        ((MEM_SLOTS_USED++))
+        MEM_SLOTS_USED=$((MEM_SLOTS_USED + 1))
       fi
       
       # Build JSON array for memory banks
