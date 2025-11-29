@@ -759,15 +759,32 @@ collect_sysinfo() {
   if [[ -z "$CPU_FREQ_BASE_MHZ" || "$CPU_FREQ_BASE_MHZ" == "0" ]] && command -v lshw >/dev/null 2>&1; then
     local lshw_cpu=$(run_as_root lshw -C cpu 2>/dev/null || echo "")
     if [[ -n "$lshw_cpu" ]]; then
-      # lshw shows "clock: 100MHz" which is the base clock, and "capacity: 4367MHz" for max
-      # The "size" field shows current frequency
-      local lshw_size=$(echo "$lshw_cpu" | grep "size:" | head -1 | sed 's/.*size: //' | grep -oE '[0-9]+')
-      local lshw_capacity=$(echo "$lshw_cpu" | grep "capacity:" | head -1 | sed 's/.*capacity: //' | grep -oE '[0-9]+')
+      # lshw shows frequencies like "size: 2397MHz" or "capacity: 4GHz" or "capacity: 4367MHz"
+      # Need to handle both MHz and GHz units
+      local lshw_size_raw=$(echo "$lshw_cpu" | grep "size:" | head -1 | sed 's/.*size: //' | grep -oE '[0-9.]+[GM]Hz')
+      local lshw_capacity_raw=$(echo "$lshw_cpu" | grep "capacity:" | head -1 | sed 's/.*capacity: //' | grep -oE '[0-9.]+[GM]Hz')
+      
+      # Helper to convert to MHz
+      convert_to_mhz() {
+        local val="$1"
+        local num=$(echo "$val" | grep -oE '[0-9.]+')
+        if echo "$val" | grep -q "GHz"; then
+          awk "BEGIN {printf \"%.0f\", $num * 1000}"
+        else
+          printf "%.0f" "$num"
+        fi
+      }
       
       # Current frequency
-      [[ -n "$lshw_size" ]] && CPU_FREQ_CURRENT_MHZ="$lshw_size"
+      if [[ -n "$lshw_size_raw" ]]; then
+        CPU_FREQ_CURRENT_MHZ=$(convert_to_mhz "$lshw_size_raw")
+      fi
       # Max frequency from capacity
-      [[ -n "$lshw_capacity" ]] && CPU_FREQ_MAX_MHZ="$lshw_capacity"
+      if [[ -n "$lshw_capacity_raw" ]]; then
+        local max_mhz=$(convert_to_mhz "$lshw_capacity_raw")
+        # Sanity check: must be > 100 MHz
+        [[ "$max_mhz" -gt 100 ]] && CPU_FREQ_MAX_MHZ="$max_mhz"
+      fi
     fi
   fi
   
@@ -1714,9 +1731,17 @@ calculate_scores() {
   SCORE_MEM_READ=$(awk "BEGIN {printf \"%.0f\", ${MEM_READ_MBS:-0}}")
   
   # Memory Latency Score (if available) - inverse, lower is better
-  # Convert to score where higher = better
+  # Note: Our latency measurement is throughput-derived, not true latency
+  # Scale it to be comparable with other scores (cap at 10000)
   if [[ -n "${MEM_LATENCY_NS:-}" ]] && [[ "${MEM_LATENCY_NS:-0}" -gt 0 ]]; then
-    SCORE_MEM_LATENCY=$(awk "BEGIN {printf \"%.0f\", 10000000 / ${MEM_LATENCY_NS}}")
+    # Lower latency = higher score, but cap to prevent dominance
+    local raw_lat_score=$(awk "BEGIN {printf \"%.0f\", 100000 / ${MEM_LATENCY_NS}}")
+    # Cap at 10000 to keep it proportional to other memory scores
+    if [[ "$raw_lat_score" -gt 10000 ]]; then
+      SCORE_MEM_LATENCY=10000
+    else
+      SCORE_MEM_LATENCY="$raw_lat_score"
+    fi
   else
     SCORE_MEM_LATENCY=0
   fi
@@ -1967,19 +1992,29 @@ print_summary() {
     echo -e "  ${BOLD}Max Freq:${NC}     ${CPU_FREQ_MAX_MHZ} MHz"
   fi
   
-  # Power information
-  if [[ -n "$POWER_IDLE_WATTS" && "$POWER_IDLE_WATTS" != "0" ]] || [[ -n "$POWER_LOAD_WATTS" && "$POWER_LOAD_WATTS" != "0" ]]; then
+  # Power information - sanity check: idle should be less than load
+  local show_idle="${POWER_IDLE_WATTS:-0}"
+  local show_load="${POWER_LOAD_WATTS:-0}"
+  
+  # If idle >= load, readings are unreliable - only show if load > idle
+  if [[ -n "$show_idle" && -n "$show_load" ]] && \
+     [[ "$(awk "BEGIN {print ($show_idle >= $show_load)}")" == "1" ]]; then
+    # Readings don't make sense, only show TDP if available
+    if [[ -n "$CPU_TDP_WATTS" && "$CPU_TDP_WATTS" != "0" ]]; then
+      echo -e "  ${BOLD}Power:${NC}        TDP: ${CPU_TDP_WATTS}W"
+    fi
+  elif [[ -n "$show_idle" && "$show_idle" != "0" ]] || [[ -n "$show_load" && "$show_load" != "0" ]]; then
     local power_info=""
     if [[ -n "$CPU_TDP_WATTS" && "$CPU_TDP_WATTS" != "0" ]]; then
       power_info="TDP: ${CPU_TDP_WATTS}W"
     fi
-    if [[ -n "$POWER_IDLE_WATTS" && "$POWER_IDLE_WATTS" != "0" ]]; then
+    if [[ -n "$show_idle" && "$show_idle" != "0" ]]; then
       [[ -n "$power_info" ]] && power_info+=", "
-      power_info+="Idle: ${POWER_IDLE_WATTS}W"
+      power_info+="Idle: ${show_idle}W"
     fi
-    if [[ -n "$POWER_LOAD_WATTS" && "$POWER_LOAD_WATTS" != "0" ]]; then
+    if [[ -n "$show_load" && "$show_load" != "0" ]]; then
       [[ -n "$power_info" ]] && power_info+=", "
-      power_info+="Load: ${POWER_LOAD_WATTS}W"
+      power_info+="Load: ${show_load}W"
     fi
     echo -e "  ${BOLD}Power:${NC}        $power_info"
   fi
