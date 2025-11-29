@@ -6,7 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Proxmox VE](https://img.shields.io/badge/Proxmox%20VE-8.x%20%7C%209.x-orange.svg)](https://www.proxmox.com/)
-[![Version](https://img.shields.io/badge/version-1.0.7-green.svg)](https://github.com/giovannirco/proxmark/releases)
+[![Version](https://img.shields.io/badge/version-1.0.8-green.svg)](https://github.com/giovannirco/proxmark/releases)
 
 [Getting Started](#getting-started) •
 [Features](#features) •
@@ -58,6 +58,18 @@ curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/master/client/pr
 curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/master/client/proxmark.sh | bash -s -- --debug
 ```
 
+**Benchmark all storage** (discovers and tests all Proxmox storage):
+
+```bash
+curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/master/client/proxmark.sh | bash -s -- --all-disks
+```
+
+**With network benchmark** (requires an iperf3 server):
+
+```bash
+curl -sL https://raw.githubusercontent.com/giovannirco/proxmark/master/client/proxmark.sh | bash -s -- --iperf 192.168.1.100
+```
+
 ### Download and Inspect First
 
 If you prefer to review the script before running:
@@ -94,8 +106,9 @@ Run directly from the Proxmox web UI shell. No installation needed.
 
 ### 📊 Comprehensive Benchmarks
 - **CPU**: Multi-threaded and single-threaded performance
-- **Memory**: Read and write throughput
+- **Memory**: Read/write throughput and latency
 - **Disk**: Random I/O (IOPS), sequential read/write (MB/s)
+- **Network**: Bandwidth and latency via iperf3 (optional)
 
 ### 🎯 Rich System Detection
 - CPU model, cores, threads, base/max frequency
@@ -104,8 +117,11 @@ Run directly from the Proxmox web UI shell. No installation needed.
 - Proxmox version, cluster info, VM/container count
 - Storage pools and configuration
 
-### 📈 Standardized Scoring
-Comparable scores across different Proxmox nodes and hardware, weighted for virtualization workloads.
+### 📈 Proxmark Score
+Large-scale scoring system (like Geekbench) with:
+- Individual scores for every metric
+- Category subtotals (CPU, Memory, Disk, Network)
+- Weighted composite score optimized for Proxmox workloads
 
 ### 📁 Detailed Output
 - Beautiful terminal output with organized sections
@@ -157,22 +173,25 @@ STORAGE
 BENCHMARK RESULTS
 ────────────────────────────────────────────────────────────────────────────
 
-┌────────────┬─────────────────────┬──────────────┬──────────────┬─────────┐
-│ Component  │ Test                │ IOPS         │ Throughput   │ Score   │
-├────────────┼─────────────────────┼──────────────┼──────────────┼─────────┤
-│ CPU        │ Multi-thread        │              │ 6743.83 e/s  │      67 │
-│ CPU        │ Single-thread       │              │  818.42 e/s  │      82 │
-├────────────┼─────────────────────┼──────────────┼──────────────┼─────────┤
-│ Memory     │ Write               │              │ 13343.45 MB/s│     267 │
-│ Memory     │ Read                │              │ 86520.68 MB/s│         │
-├────────────┼─────────────────────┼──────────────┼──────────────┼─────────┤
-│ Disk       │ 4K Random R/W       │        17688 │   68.56 MB/s │      35 │
-│ Disk       │ Sequential Read     │          922 │  922.92 MB/s │      92 │
-│ Disk       │ Sequential Write    │          317 │  317.91 MB/s │         │
-└────────────┴─────────────────────┴──────────────┴──────────────┴─────────┘
+┌────────────┬─────────────────────┬──────────────┬──────────────┬──────────┐
+│ Component  │ Test                │ IOPS         │ Throughput   │ Score    │
+├────────────┼─────────────────────┼──────────────┼──────────────┼──────────┤
+│ CPU        │ Multi-thread        │              │ 6743.83 e/s  │     6743 │
+│ CPU        │ Single-thread       │              │  818.42 e/s  │      818 │
+├────────────┼─────────────────────┼──────────────┼──────────────┼──────────┤
+│ Memory     │ Write               │              │ 13343.45 MB/s│    13343 │
+│ Memory     │ Read                │              │ 86520.68 MB/s│    86520 │
+│ Memory     │ Latency             │              │    0.02 ms   │    50000 │
+├────────────┼─────────────────────┼──────────────┼──────────────┼──────────┤
+│ Disk       │ 4K Random R/W       │        17688 │   68.56 MB/s │    17688 │
+│ Disk       │ Sequential Read     │          922 │  922.92 MB/s │     9229 │
+│ Disk       │ Sequential Write    │          317 │  317.91 MB/s │     3179 │
+└────────────┴─────────────────────┴──────────────┴──────────────┴──────────┘
+
+Category Scores: CPU: 7561 | Memory: 1049 | Disk: 18917
 
 ╭──────────────────────────────────────────────────────────────────────────╮
-│                           TOTAL SCORE: 968                               │
+│                         PROXMARK SCORE: 12847                            │
 ╰──────────────────────────────────────────────────────────────────────────╯
 
 📁 JSON saved: /tmp/proxmark-result-20251129T170738Z.json
@@ -202,10 +221,12 @@ Options:
 
 Configuration:
   --disk-path PATH    Directory for disk benchmarks (default: /var/lib/vz on Proxmox)
-  --all-disks         Benchmark all detected storage paths (coming soon)
+  --all-disks         Benchmark all detected storage paths
+  --iperf HOST[:PORT] Run network benchmark against iperf3 server
   --output FILE       Custom output path for JSON results
   --tag TAG           Add a tag to results (can use multiple times)
   --notes "TEXT"      Add notes to the benchmark result
+  --non-interactive   Don't prompt for additional disks
 
 Environment Variables:
   PROXMARK_DISK_PATH   Same as --disk-path
@@ -227,6 +248,7 @@ Uses `sysbench cpu` to measure:
 Uses `sysbench memory` to measure:
 - **Write throughput**: MB/s writing to memory
 - **Read throughput**: MB/s reading from memory
+- **Latency**: Random access latency (lower is better)
 
 ### Disk Benchmark
 
@@ -237,12 +259,22 @@ Uses `fio` to measure (critical for Proxmox VM performance):
 
 **Tip**: The script auto-detects `/var/lib/vz` to benchmark your actual VM storage!
 
-## Scoring
+### Network Benchmark (Optional)
 
-Scores are weighted for Proxmox virtualization workloads:
-- **CPU**: 25% (split between multi and single-thread)
-- **Memory**: 15%
-- **Disk**: 60% (disk I/O is typically the bottleneck for VMs)
+Uses `iperf3` when `--iperf` is specified:
+- **Bandwidth**: Network throughput in Mbps
+- **Latency**: Round-trip time via ping
+
+Useful for testing network storage performance or cluster interconnects.
+
+## Proxmark Score
+
+The **Proxmark Score** uses a large-scale scoring system (like Geekbench) where every metric gets an individual score, then combined into category totals and a weighted overall score.
+
+**Score Weights** (optimized for Proxmox workloads):
+- **CPU**: 20% (multi + single-thread combined)
+- **Memory**: 20% (throughput + latency)
+- **Disk**: 60% (disk I/O is typically the VM bottleneck)
 
 Higher scores = better performance for running VMs and containers.
 
@@ -250,7 +282,10 @@ Higher scores = better performance for running VMs and containers.
 
 - [x] Benchmark script with Proxmox detection
 - [x] CPU, Memory, Disk benchmarks
-- [x] JSON output and scoring
+- [x] Memory latency benchmark
+- [x] Network benchmark (iperf3)
+- [x] Multi-disk discovery and testing
+- [x] JSON output and Proxmark Score
 - [x] Detailed system info (CPU freq, memory channels, etc.)
 - [x] Proxmox cluster and workload info
 - [x] Log file output

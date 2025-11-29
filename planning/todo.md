@@ -68,6 +68,7 @@
 #### Memory Benchmark
 - [x] Write throughput test
 - [x] Read throughput test
+- [x] Memory latency test (random access pattern)
 - [x] Parse MB/s
 - [x] Parse total operations
 - [ ] Configurable duration via `--mem-time`
@@ -88,7 +89,16 @@
 - [ ] Parse latency metrics from fio
 - [ ] Direct I/O option (`--disk-direct`)
 - [ ] Configurable test file size (`--disk-size`)
-- [ ] Benchmark all detected storage paths (`--all-disks`)
+- [x] Benchmark all detected storage paths (`--all-disks`)
+- [x] Discover Proxmox storage pools automatically
+- [x] Interactive prompt for additional disks
+- [x] Auto-disable interactive in pipe mode
+
+#### Network Benchmark
+- [x] Optional iperf3 benchmark (`--iperf HOST[:PORT]`)
+- [x] Bandwidth measurement (Mbps)
+- [x] Latency measurement (ping)
+- [x] Auto-install iperf3 if needed
 
 ### 1.3 Output & UX
 
@@ -124,12 +134,14 @@
 - [x] Memory info in JSON (type, speed, channels, ECC)
 - [ ] Pretty-print option (`--pretty`)
 
-#### Score Calculation
-- [x] Define baseline values
-- [x] Calculate individual scores
-- [x] Calculate composite total score
+#### Score Calculation (Proxmark Score)
+- [x] Larger scale scoring (like Geekbench)
+- [x] Score ALL metrics (no empty cells)
+- [x] Category subtotals (CPU, Memory, Disk, Network)
+- [x] Calculate composite total score (Proxmark Score)
 - [x] Display scores in output
 - [x] Weight disk I/O heavily (60%)
+- [x] Weight CPU (20%) and Memory (20%)
 
 ### 1.4 CLI Interface
 - [x] Basic script execution
@@ -142,7 +154,9 @@
 - [x] Skip upload (`--no-upload`)
 - [x] Force upload (`--upload`)
 - [x] JSON-only output (`--json`)
-- [x] All-disks flag placeholder (`--all-disks`)
+- [x] All-disks flag (`--all-disks`)
+- [x] Network benchmark (`--iperf HOST[:PORT]`)
+- [x] Non-interactive mode (`--non-interactive`)
 
 ### 1.5 Error Handling
 - [x] Basic error handling (set -euo pipefail)
@@ -262,9 +276,10 @@
 ---
 
 ## Backlog (Future Ideas)
-- [ ] Network benchmark between nodes
+- [x] Network benchmark via iperf3 (v1.0.8)
 - [ ] Grafana dashboard export
 - [ ] Prometheus metrics endpoint
 - [ ] Slack/Discord notifications
 - [ ] Historical tracking per node UUID
 - [ ] Multi-node benchmark orchestration
+- [ ] Network benchmark between Proxmox nodes (auto-discovery)

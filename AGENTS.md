@@ -12,10 +12,13 @@ Key points:
 - Target: Proxmox VE 8.x and 9.x only
 - Uses apt package manager (Proxmox is Debian-based)
 
-## Current Version: 1.0.7
+## Current Version: 1.0.8
 
 Phase 1 (MVP Script) is complete with:
-- CPU, Memory, Disk benchmarks
+- CPU, Memory, Disk, Network benchmarks
+- Memory latency testing
+- Multi-disk discovery and benchmarking
+- Proxmark Score (large-scale scoring like Geekbench)
 - Rich system detection (CPU freq, memory channels, ECC, etc.)
 - Proxmox-specific info (cluster, VMs, storage pools)
 - Log file output
@@ -25,7 +28,7 @@ Phase 1 (MVP Script) is complete with:
 
 ```
 proxmark/
-├── client/proxmark.sh    # Main Bash benchmark script (v1.0.7)
+├── client/proxmark.sh    # Main Bash benchmark script (v1.0.8)
 ├── server/               # TypeScript API (future - Phase 2)
 ├── web/                  # Next.js web UI (future - Phase 3)
 ├── planning/
