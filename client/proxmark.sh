@@ -13,7 +13,7 @@
 set -euo pipefail
 
 # === Version ===
-VERSION="1.0.7"
+VERSION="1.0.8"
 
 # === Colors ===
 RED='\033[0;31m'
@@ -46,11 +46,13 @@ QUIET=false
 JSON_ONLY=false
 NO_INSTALL=false
 ALL_DISKS=false
+INTERACTIVE=true
 HELP=false
 SHOW_VERSION=false
 TAGS=""
 NOTES=""
 CUSTOM_OUTPUT=""
+IPERF_SERVER=""
 
 # === Derived variables ===
 TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
@@ -106,10 +108,12 @@ ${BOLD}OPTIONS:${NC}
 
 ${BOLD}CONFIGURATION:${NC}
     --disk-path PATH    Directory to use for disk benchmarks (default: /var/lib/vz on Proxmox)
-    --all-disks         Benchmark all detected storage paths (coming soon)
+    --all-disks         Benchmark all detected storage paths
+    --iperf HOST[:PORT] Run network benchmark against iperf3 server (default port: 5201)
     --output FILE       Custom output path for JSON results
     --tag TAG           Add a tag to results (can be used multiple times)
     --notes "TEXT"      Add notes to the benchmark result
+    --non-interactive   Don't prompt for additional disks
 
 ${BOLD}ENVIRONMENT VARIABLES:${NC}
     PROXMARK_DISK_PATH   Same as --disk-path
@@ -125,14 +129,17 @@ ${BOLD}EXAMPLES:${NC}
     # Quick benchmark (~2 min)
     bash proxmark.sh --quick
 
-    # Benchmark specific path
-    bash proxmark.sh --disk-path /mnt/nvme-storage
+    # Benchmark all storage locations
+    bash proxmark.sh --all-disks
+
+    # Include network benchmark (requires iperf3 server)
+    bash proxmark.sh --iperf 192.168.1.100
 
     # Tag your Proxmox node
     bash proxmark.sh --tag "production" --tag "nvme" --notes "New node"
 
-    # JSON output only
-    bash proxmark.sh --json --no-upload
+    # Non-interactive mode (for scripts)
+    curl -sL .../proxmark.sh | bash -s -- --non-interactive
 
     # Debug mode for troubleshooting
     bash proxmark.sh --debug
@@ -357,6 +364,14 @@ parse_args() {
         NOTES="$2"
         shift 2
         ;;
+      --iperf)
+        IPERF_SERVER="$2"
+        shift 2
+        ;;
+      --non-interactive)
+        INTERACTIVE=false
+        shift
+        ;;
       *)
         log_error "Unknown option: $1"
         usage
@@ -364,6 +379,11 @@ parse_args() {
         ;;
     esac
   done
+  
+  # When running via pipe, disable interactive mode
+  if [[ ! -t 0 ]]; then
+    INTERACTIVE=false
+  fi
   
   # Apply custom output path if specified
   if [[ -n "$CUSTOM_OUTPUT" ]]; then
@@ -922,6 +942,27 @@ run_mem_benchmark() {
   MEM_READ_OPS="$(echo "$out" | awk '/Total operations:/ {print $3}' || echo "0")"
   
   log_success "Memory read: ${MEM_READ_MBS} MB/s"
+  
+  # Memory latency test (smaller block, random access pattern)
+  log "Running Memory benchmark (latency, ${MEM_TIME}s)..."
+  
+  local lat_time=$((MEM_TIME / 2))
+  [[ $lat_time -lt 5 ]] && lat_time=5
+  
+  out="$(sysbench memory \
+    --memory-block-size=64 \
+    --memory-total-size=100G \
+    --memory-oper=read \
+    --memory-access-mode=rnd \
+    --time="$lat_time" \
+    --threads=1 run 2>&1)"
+  
+  # Extract latency from sysbench output (avg latency in ms, convert to ns)
+  local lat_avg_ms=$(echo "$out" | awk '/avg:/ {print $2}' | head -1 || echo "0")
+  MEM_LATENCY_NS=$(awk "BEGIN {printf \"%.0f\", $lat_avg_ms * 1000000}")
+  MEM_LATENCY_MS="$lat_avg_ms"
+  
+  log_success "Memory latency: ${lat_avg_ms} ms avg"
 }
 
 run_disk_benchmark() {
@@ -1075,35 +1116,151 @@ run_disk_benchmark() {
   rm -f "$filename"
 }
 
+run_network_benchmark() {
+  # Only run if iperf server is specified
+  if [[ -z "$IPERF_SERVER" ]]; then
+    NET_BW_MBPS="0"
+    NET_LATENCY_MS="0"
+    SCORE_NET_BW=0
+    SCORE_NET_LATENCY=0
+    return
+  fi
+  
+  # Parse server:port
+  local server="${IPERF_SERVER%:*}"
+  local port="${IPERF_SERVER##*:}"
+  [[ "$port" == "$server" ]] && port="5201"  # Default port
+  
+  # Check if iperf3 is available
+  if ! command -v iperf3 >/dev/null 2>&1; then
+    log "Installing iperf3 for network benchmark..."
+    run_as_root apt-get install -y iperf3 >/dev/null 2>&1 || {
+      log_warning "Could not install iperf3, skipping network benchmark"
+      NET_BW_MBPS="0"
+      NET_LATENCY_MS="0"
+      SCORE_NET_BW=0
+      SCORE_NET_LATENCY=0
+      return
+    }
+  fi
+  
+  local duration=$((DISK_RUNTIME / 3))
+  [[ $duration -lt 10 ]] && duration=10
+  
+  log "Running Network benchmark (iperf3 to $server:$port, ${duration}s)..."
+  
+  # Run iperf3 test
+  local out
+  out=$(iperf3 -c "$server" -p "$port" -t "$duration" -J 2>&1) || {
+    log_warning "iperf3 failed to connect to $server:$port"
+    NET_BW_MBPS="0"
+    NET_LATENCY_MS="0"
+    SCORE_NET_BW=0
+    SCORE_NET_LATENCY=0
+    return
+  }
+  
+  # Parse results
+  if echo "$out" | jq -e '.end' >/dev/null 2>&1; then
+    # Bandwidth in Mbps
+    local bw_bps=$(echo "$out" | jq -r '.end.sum_sent.bits_per_second // 0')
+    NET_BW_MBPS=$(awk "BEGIN {printf \"%.2f\", $bw_bps / 1000000}")
+    
+    # Retransmits (as a proxy for network quality)
+    local retransmits=$(echo "$out" | jq -r '.end.sum_sent.retransmits // 0')
+    
+    log_success "Network bandwidth: ${NET_BW_MBPS} Mbps (retransmits: $retransmits)"
+    
+    # Score: 1 Mbps = 1 point
+    SCORE_NET_BW=$(awk "BEGIN {printf \"%.0f\", $NET_BW_MBPS}")
+  else
+    log_warning "Failed to parse iperf3 output"
+    NET_BW_MBPS="0"
+    SCORE_NET_BW=0
+  fi
+  
+  # Latency test (ping)
+  log "Running Network latency test..."
+  local ping_out
+  ping_out=$(ping -c 10 -q "$server" 2>&1) || true
+  NET_LATENCY_MS=$(echo "$ping_out" | awk -F'/' '/avg/ {print $5}' || echo "0")
+  
+  if [[ -n "$NET_LATENCY_MS" && "$NET_LATENCY_MS" != "0" ]]; then
+    log_success "Network latency: ${NET_LATENCY_MS} ms"
+    # Score: inverse of latency (lower latency = higher score)
+    SCORE_NET_LATENCY=$(awk "BEGIN {if ($NET_LATENCY_MS > 0) printf \"%.0f\", 10000 / $NET_LATENCY_MS; else print 0}")
+  else
+    NET_LATENCY_MS="0"
+    SCORE_NET_LATENCY=0
+  fi
+}
+
 # === Score Calculation ===
+# Proxmark Score System (larger scale like Geekbench)
+# Scores are based on performance per unit, scaled for readability
+# Higher = better
 
 calculate_scores() {
   log_verbose "Calculating scores..."
   
-  # Baselines (mid-range reference hardware)
-  local cpu_multi_baseline=10000
-  local cpu_single_baseline=1000
-  local mem_baseline=5000
-  local disk_iops_baseline=50000
-  local disk_bw_baseline=1000
+  # CPU Scores - based on events/second
+  # ~1000 e/s single-thread = 1000 points (typical modern CPU)
+  SCORE_CPU_MULTI=$(awk "BEGIN {printf \"%.0f\", ${CPU_MULTI_EPS:-0}}")
+  SCORE_CPU_SINGLE=$(awk "BEGIN {printf \"%.0f\", ${CPU_SINGLE_EPS:-0}}")
   
-  # Calculate individual scores
-  SCORE_CPU_MULTI=$(awk "BEGIN {printf \"%.0f\", (${CPU_MULTI_EPS:-0} / $cpu_multi_baseline) * 100}")
-  SCORE_CPU_SINGLE=$(awk "BEGIN {printf \"%.0f\", (${CPU_SINGLE_EPS:-0} / $cpu_single_baseline) * 100}")
-  SCORE_MEMORY=$(awk "BEGIN {printf \"%.0f\", (${MEM_WRITE_MBS:-0} / $mem_baseline) * 100}")
-  SCORE_DISK_IOPS=$(awk "BEGIN {printf \"%.0f\", (${DISK_RANDRW_IOPS_TOTAL:-0} / $disk_iops_baseline) * 100}")
-  SCORE_DISK_BW=$(awk "BEGIN {printf \"%.0f\", (${DISK_SEQ_READ_MB:-0} / $disk_bw_baseline) * 100}")
+  # Memory Scores - based on MB/s
+  # Scaled: 1 MB/s = 1 point
+  SCORE_MEM_WRITE=$(awk "BEGIN {printf \"%.0f\", ${MEM_WRITE_MBS:-0}}")
+  SCORE_MEM_READ=$(awk "BEGIN {printf \"%.0f\", ${MEM_READ_MBS:-0}}")
   
-  # Composite score (weighted)
-  # CPU: 25%, Memory: 15%, Disk: 60%
+  # Memory Latency Score (if available) - inverse, lower is better
+  # Convert to score where higher = better
+  if [[ -n "${MEM_LATENCY_NS:-}" ]] && [[ "${MEM_LATENCY_NS:-0}" -gt 0 ]]; then
+    SCORE_MEM_LATENCY=$(awk "BEGIN {printf \"%.0f\", 10000000 / ${MEM_LATENCY_NS}}")
+  else
+    SCORE_MEM_LATENCY=0
+  fi
+  
+  # Disk Scores
+  # IOPS: 1 IOPS = 1 point (4K random is typically 10K-500K)
+  SCORE_DISK_RAND_IOPS=$(awk "BEGIN {printf \"%.0f\", ${DISK_RANDRW_IOPS_TOTAL:-0}}")
+  SCORE_DISK_SEQ_READ_IOPS=$(awk "BEGIN {printf \"%.0f\", ${DISK_SEQ_READ_IOPS:-0}}")
+  SCORE_DISK_SEQ_WRITE_IOPS=$(awk "BEGIN {printf \"%.0f\", ${DISK_SEQ_WRITE_IOPS:-0}}")
+  
+  # Bandwidth: 1 MB/s = 10 points (makes sequential scores comparable to IOPS)
+  SCORE_DISK_RAND_BW=$(awk "BEGIN {printf \"%.0f\", (${DISK_RANDRW_BW_R_MB:-0} + ${DISK_RANDRW_BW_W_MB:-0}) * 10}")
+  SCORE_DISK_SEQ_READ_BW=$(awk "BEGIN {printf \"%.0f\", ${DISK_SEQ_READ_MB:-0} * 10}")
+  SCORE_DISK_SEQ_WRITE_BW=$(awk "BEGIN {printf \"%.0f\", ${DISK_SEQ_WRITE_MB:-0} * 10}")
+  
+  # Disk Latency Score (if available) - inverse, lower is better
+  if [[ -n "${DISK_RANDRW_LAT_AVG_US:-}" ]] && [[ "${DISK_RANDRW_LAT_AVG_US:-0}" -gt 0 ]]; then
+    SCORE_DISK_LATENCY=$(awk "BEGIN {printf \"%.0f\", 1000000 / ${DISK_RANDRW_LAT_AVG_US}}")
+  else
+    SCORE_DISK_LATENCY=0
+  fi
+  
+  # Network Scores (if iperf was run)
+  SCORE_NET_BW=${SCORE_NET_BW:-0}
+  SCORE_NET_LATENCY=${SCORE_NET_LATENCY:-0}
+  
+  # Category Subtotals
+  SCORE_CPU_TOTAL=$(awk "BEGIN {printf \"%.0f\", ($SCORE_CPU_MULTI + $SCORE_CPU_SINGLE)}")
+  SCORE_MEM_TOTAL=$(awk "BEGIN {printf \"%.0f\", ($SCORE_MEM_WRITE + $SCORE_MEM_READ) / 100 + $SCORE_MEM_LATENCY}")
+  SCORE_DISK_TOTAL=$(awk "BEGIN {printf \"%.0f\", $SCORE_DISK_RAND_IOPS + ($SCORE_DISK_SEQ_READ_BW + $SCORE_DISK_SEQ_WRITE_BW) / 10}")
+  
+  # Total Score (weighted for Proxmox workloads)
+  # CPU: 20%, Memory: 20%, Disk: 60%
   SCORE_TOTAL=$(awk "BEGIN {
-    cpu_score = ($SCORE_CPU_MULTI + $SCORE_CPU_SINGLE) / 2
-    disk_score = ($SCORE_DISK_IOPS + $SCORE_DISK_BW) / 2
-    total = (cpu_score * 0.25) + ($SCORE_MEMORY * 0.15) + (disk_score * 0.60)
-    printf \"%.0f\", total * 10
+    cpu = ($SCORE_CPU_MULTI + $SCORE_CPU_SINGLE)
+    mem = ($SCORE_MEM_WRITE + $SCORE_MEM_READ) / 100
+    disk = $SCORE_DISK_RAND_IOPS + ($SCORE_DISK_SEQ_READ_BW + $SCORE_DISK_SEQ_WRITE_BW) / 20
+    total = (cpu * 0.20) + (mem * 0.20) + (disk * 0.60)
+    printf \"%.0f\", total
   }")
   
-  log_verbose "Scores - CPU: $SCORE_CPU_MULTI/$SCORE_CPU_SINGLE, Mem: $SCORE_MEMORY, Disk: $SCORE_DISK_IOPS/$SCORE_DISK_BW, Total: $SCORE_TOTAL"
+  log_verbose "Scores - CPU: $SCORE_CPU_MULTI/$SCORE_CPU_SINGLE, Mem: $SCORE_MEM_WRITE/$SCORE_MEM_READ"
+  log_verbose "Scores - Disk IOPS: $SCORE_DISK_RAND_IOPS, BW: $SCORE_DISK_SEQ_READ_BW/$SCORE_DISK_SEQ_WRITE_BW"
+  log_verbose "Total Score: $SCORE_TOTAL"
 }
 
 # === Output Generation ===
@@ -1308,24 +1465,37 @@ print_summary() {
   # Calculate combined MB/s for random r/w
   local randrw_total_mb=$(awk "BEGIN {printf \"%.2f\", ${DISK_RANDRW_BW_R_MB:-0} + ${DISK_RANDRW_BW_W_MB:-0}}")
   
-  echo -e "${DIM}┌────────────┬─────────────────────┬──────────────┬──────────────┬─────────┐${NC}"
-  echo -e "${DIM}│${NC}${BOLD} Component  ${DIM}│${NC}${BOLD} Test                ${DIM}│${NC}${BOLD} IOPS         ${DIM}│${NC}${BOLD} Throughput   ${DIM}│${NC}${BOLD} Score   ${DIM}│${NC}"
-  echo -e "${DIM}├────────────┼─────────────────────┼──────────────┼──────────────┼─────────┤${NC}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "CPU" "Multi-thread" "${CPU_MULTI_EPS} e/s" "${SCORE_CPU_MULTI}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "CPU" "Single-thread" "${CPU_SINGLE_EPS} e/s" "${SCORE_CPU_SINGLE}"
-  echo -e "${DIM}├────────────┼─────────────────────┼──────────────┼──────────────┼─────────┤${NC}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "Memory" "Write" "${MEM_WRITE_MBS} MB/s" "${SCORE_MEMORY}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC}         ${DIM}│${NC}\n" "Memory" "Read" "${MEM_READ_MBS} MB/s"
-  echo -e "${DIM}├────────────┼─────────────────────┼──────────────┼──────────────┼─────────┤${NC}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC} %12s ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "Disk" "4K Random R/W" "${DISK_RANDRW_IOPS_TOTAL}" "${randrw_total_mb} MB/s" "${SCORE_DISK_IOPS}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC} %12s ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "Disk" "Sequential Read" "${DISK_SEQ_READ_IOPS:-0}" "${DISK_SEQ_READ_MB} MB/s" "${SCORE_DISK_BW}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC} %12s ${DIM}│${NC} %10s   ${DIM}│${NC}         ${DIM}│${NC}\n" "Disk" "Sequential Write" "${DISK_SEQ_WRITE_IOPS:-0}" "${DISK_SEQ_WRITE_MB} MB/s"
-  echo -e "${DIM}└────────────┴─────────────────────┴──────────────┴──────────────┴─────────┘${NC}"
+  echo -e "${DIM}┌────────────┬─────────────────────┬──────────────┬──────────────┬──────────┐${NC}"
+  echo -e "${DIM}│${NC}${BOLD} Component  ${DIM}│${NC}${BOLD} Test                ${DIM}│${NC}${BOLD} IOPS         ${DIM}│${NC}${BOLD} Throughput   ${DIM}│${NC}${BOLD} Score    ${DIM}│${NC}"
+  echo -e "${DIM}├────────────┼─────────────────────┼──────────────┼──────────────┼──────────┤${NC}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "CPU" "Multi-thread" "${CPU_MULTI_EPS} e/s" "${SCORE_CPU_MULTI}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "CPU" "Single-thread" "${CPU_SINGLE_EPS} e/s" "${SCORE_CPU_SINGLE}"
+  echo -e "${DIM}├────────────┼─────────────────────┼──────────────┼──────────────┼──────────┤${NC}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Memory" "Write" "${MEM_WRITE_MBS} MB/s" "${SCORE_MEM_WRITE}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Memory" "Read" "${MEM_READ_MBS} MB/s" "${SCORE_MEM_READ}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Memory" "Latency" "${MEM_LATENCY_MS:-0} ms" "${SCORE_MEM_LATENCY}"
+  echo -e "${DIM}├────────────┼─────────────────────┼──────────────┼──────────────┼──────────┤${NC}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC} %12s ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Disk" "4K Random R/W" "${DISK_RANDRW_IOPS_TOTAL}" "${randrw_total_mb} MB/s" "${SCORE_DISK_RAND_IOPS}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC} %12s ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Disk" "Sequential Read" "${DISK_SEQ_READ_IOPS:-0}" "${DISK_SEQ_READ_MB} MB/s" "${SCORE_DISK_SEQ_READ_BW}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC} %12s ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Disk" "Sequential Write" "${DISK_SEQ_WRITE_IOPS:-0}" "${DISK_SEQ_WRITE_MB} MB/s" "${SCORE_DISK_SEQ_WRITE_BW}"
+  
+  # Network section (only if iperf was run)
+  if [[ -n "$IPERF_SERVER" ]] && [[ "${NET_BW_MBPS:-0}" != "0" ]]; then
+    echo -e "${DIM}├────────────┼─────────────────────┼──────────────┼──────────────┼──────────┤${NC}"
+    printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Network" "Bandwidth" "${NET_BW_MBPS} Mbps" "${SCORE_NET_BW}"
+    printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Network" "Latency" "${NET_LATENCY_MS} ms" "${SCORE_NET_LATENCY}"
+  fi
+  
+  echo -e "${DIM}└────────────┴─────────────────────┴──────────────┴──────────────┴──────────┘${NC}"
+  echo
+  
+  # Category subtotals
+  echo -e "${DIM}Category Scores: CPU: ${SCORE_CPU_TOTAL:-0} | Memory: ${SCORE_MEM_TOTAL:-0} | Disk: ${SCORE_DISK_TOTAL:-0}${NC}"
   echo
   
   # Total score - make it stand out
   echo -e "${CYAN}╭──────────────────────────────────────────────────────────────────────────╮${NC}"
-  printf "${CYAN}│${NC}                           ${BOLD}TOTAL SCORE: ${GREEN}%-6s${NC}                           ${CYAN}│${NC}\n" "${SCORE_TOTAL}"
+  printf "${CYAN}│${NC}                         ${BOLD}PROXMARK SCORE: ${GREEN}%-8s${NC}                        ${CYAN}│${NC}\n" "${SCORE_TOTAL}"
   echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────────────╯${NC}"
   echo
   
@@ -1510,6 +1680,7 @@ main() {
   run_cpu_benchmark
   run_mem_benchmark
   run_disk_benchmark
+  run_network_benchmark
   
   calculate_scores
   generate_json
