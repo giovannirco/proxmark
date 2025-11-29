@@ -7,7 +7,7 @@
 
 ---
 
-## Phase 1 – MVP Script (Proxmox-focused)
+## Phase 1 – MVP Script (Proxmox-focused) ✅
 
 ### 1.1 Repository Setup
 - [x] Initialize git repository
@@ -15,6 +15,7 @@
 - [x] Add LICENSE (MIT)
 - [x] Add README.md
 - [x] Add CONTRIBUTING.md
+- [x] Add AGENTS.md (AI guidelines)
 - [x] Set up .gitignore
 
 ### 1.2 Script Core (`client/proxmark.sh`)
@@ -25,27 +26,35 @@
 - [x] Auto-install missing dependencies via apt
 - [x] Add `--no-install` flag to skip auto-install
 - [x] Verify running on Proxmox host (warn if not detected)
+- [x] Handle Proxmox enterprise repo errors gracefully
 - [ ] Validate tool versions meet minimum requirements
 
 #### System Information Collection
 - [x] Hostname
-- [x] CPU model, cores
-- [x] CPU threads (vs cores)
-- [x] CPU sockets count
+- [x] CPU model, cores, threads, sockets
+- [x] CPU base frequency detection
+- [x] CPU max/boost frequency detection
 - [x] Total RAM
+- [x] Memory type detection (DDR4/DDR5)
+- [x] Memory speed detection (MT/s)
+- [x] Memory channel configuration (Single/Dual/Quad/etc.)
+- [x] Memory slot usage (used/total)
+- [x] Memory ECC detection
 - [x] Kernel version
 - [x] OS/distro name
 - [x] Root disk device and model
 - [x] Disk type detection (nvme/ssd/hdd)
 - [x] Disk size
-- [x] Virtualization platform detection
-- [x] Proxmox version detection
-- [x] Memory type detection (DDR4/DDR5) - best effort
-- [x] Memory speed detection
-- [x] CPU base/max frequency detection
 - [x] LVM/device-mapper disk resolution
-- [ ] Proxmox cluster info (if clustered)
-- [ ] Storage configuration (local, ZFS, Ceph, etc.)
+- [x] Virtualization platform detection
+- [x] Proxmox version detection (pveversion)
+- [x] Proxmox node name
+- [x] Proxmox cluster info (pvecm)
+- [x] Proxmox VM and container count (qm, pct)
+- [x] Proxmox storage pools (pvesm)
+- [x] Proxmox subscription status
+- [ ] ZFS pool detection and info
+- [ ] Ceph cluster detection
 
 #### CPU Benchmark
 - [x] Multi-threaded sysbench cpu test
@@ -69,15 +78,17 @@
 - [x] Sequential read test
 - [x] Sequential write test
 - [x] Parse IOPS (JSON output)
-- [x] Parse bandwidth (JSON output)
+- [x] Parse bandwidth MB/s (JSON output)
+- [x] Show both IOPS and MB/s for all tests
 - [x] Cleanup test file after run
 - [x] Disk space check before fio test
 - [x] I/O engine fallback (libaio → sync)
-- [x] Auto-detect /var/lib/vz or primary Proxmox storage
+- [x] Auto-detect /var/lib/vz on Proxmox
 - [x] Warn when benchmarking tmpfs (RAM disk)
 - [ ] Parse latency metrics from fio
 - [ ] Direct I/O option (`--disk-direct`)
 - [ ] Configurable test file size (`--disk-size`)
+- [ ] Benchmark all detected storage paths (`--all-disks`)
 
 ### 1.3 Output & UX
 
@@ -92,6 +103,7 @@
 - [x] Verbose mode (`-v`, `--verbose`)
 - [x] Quiet mode (`-q`, `--quiet`)
 - [x] Debug mode (`--debug`) with system info dump
+- [x] Organized sections (System, CPU, Memory, Storage, Results)
 - [ ] Progress bar for each test (live update)
 - [ ] ETA display
 - [ ] Spinner while running tests
@@ -107,6 +119,9 @@
 - [x] Include run UUID for tracking
 - [x] Log file output (proxmark-*.log)
 - [x] Debug file output (proxmark-*.debug) with --debug
+- [x] Write summary to log file
+- [x] Proxmox info in JSON (cluster, VMs, storage)
+- [x] Memory info in JSON (type, speed, channels, ECC)
 - [ ] Pretty-print option (`--pretty`)
 
 #### Score Calculation
@@ -114,6 +129,7 @@
 - [x] Calculate individual scores
 - [x] Calculate composite total score
 - [x] Display scores in output
+- [x] Weight disk I/O heavily (60%)
 
 ### 1.4 CLI Interface
 - [x] Basic script execution
@@ -126,23 +142,27 @@
 - [x] Skip upload (`--no-upload`)
 - [x] Force upload (`--upload`)
 - [x] JSON-only output (`--json`)
+- [x] All-disks flag placeholder (`--all-disks`)
 
 ### 1.5 Error Handling
 - [x] Basic error handling (set -euo pipefail)
 - [x] Disk space check before fio test
 - [x] Cleanup on interrupt (trap SIGINT/TERM)
+- [x] Handle apt errors from enterprise repos
+- [x] Fallback I/O engine for fio
 - [ ] Graceful handling of missing permissions
 - [ ] Timeout handling for hung benchmarks
 - [ ] Retry logic for failed tests
-- [ ] Clear error messages for common issues
 
 ### 1.6 Testing
-- [x] Test on Proxmox VE 9.x (v1.0.4 verified)
+- [x] Test on Proxmox VE 9.x
 - [ ] Test on Proxmox VE 8.x
 - [x] Test on fresh Proxmox install
 - [x] Test from Proxmox web UI shell
 - [x] Test via SSH
 - [x] Test with pre-installed dependencies
+- [x] Test LVM disk detection
+- [x] Test memory detection (DDR4)
 
 ---
 
@@ -213,7 +233,7 @@
 - [ ] Handle network errors gracefully
 
 ### 4.2 Deployment
-- [ ] Set up domain
+- [ ] Set up domain (proxmark.io)
 - [ ] Deploy API server
 - [ ] Deploy web UI
 - [ ] Host script on CDN
@@ -224,13 +244,13 @@
 ## Phase 5 – Proxmox-Specific Features
 
 ### 5.1 Enhanced Detection
-- [ ] ZFS pool detection and info
+- [ ] ZFS pool detection and benchmarks
 - [ ] Ceph cluster detection
-- [ ] Network storage mounts
-- [ ] Cluster membership info
+- [ ] Network storage mounts (NFS, iSCSI)
+- [ ] GPU passthrough detection
 
 ### 5.2 Additional Benchmarks
-- [ ] ZFS-specific benchmarks
+- [ ] ZFS-specific benchmarks (sync write, ARC)
 - [ ] Network storage benchmarks
 - [ ] VM migration speed test (future)
 
@@ -242,9 +262,9 @@
 ---
 
 ## Backlog (Future Ideas)
-- [ ] GPU passthrough detection
 - [ ] Network benchmark between nodes
 - [ ] Grafana dashboard export
 - [ ] Prometheus metrics endpoint
 - [ ] Slack/Discord notifications
 - [ ] Historical tracking per node UUID
+- [ ] Multi-node benchmark orchestration
