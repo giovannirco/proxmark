@@ -13,7 +13,7 @@
 set -euo pipefail
 
 # === Version ===
-VERSION="1.0.4"
+VERSION="1.0.5"
 
 # === Colors ===
 RED='\033[0;31m'
@@ -55,6 +55,8 @@ CUSTOM_OUTPUT=""
 # === Derived variables ===
 TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
 RESULT_JSON="${RESULT_DIR}/proxmark-result-${TIMESTAMP}.json"
+LOG_FILE="${RESULT_DIR}/proxmark-${TIMESTAMP}.log"
+DEBUG_FILE="${RESULT_DIR}/proxmark-${TIMESTAMP}.debug"
 RUN_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "unknown-$(date +%s)")
 
 # === Helper Functions ===
@@ -142,7 +144,25 @@ ${BOLD}MORE INFO:${NC}
 EOF
 }
 
+write_log() {
+  local level="$1"
+  shift
+  local msg="$*"
+  local ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  
+  # Always write to log file if it exists
+  if [[ -n "${LOG_FILE:-}" ]]; then
+    echo "[$ts] [$level] $msg" >> "$LOG_FILE" 2>/dev/null || true
+  fi
+  
+  # Write to debug file if in debug mode
+  if [[ "$DEBUG" == "true" ]] && [[ -n "${DEBUG_FILE:-}" ]]; then
+    echo "[$ts] [$level] $msg" >> "$DEBUG_FILE" 2>/dev/null || true
+  fi
+}
+
 log() {
+  write_log "INFO" "$*"
   if [[ "$QUIET" == "true" ]] || [[ "$JSON_ONLY" == "true" ]]; then
     return
   fi
@@ -150,6 +170,7 @@ log() {
 }
 
 log_success() {
+  write_log "OK" "$*"
   if [[ "$QUIET" == "true" ]] || [[ "$JSON_ONLY" == "true" ]]; then
     return
   fi
@@ -157,6 +178,7 @@ log_success() {
 }
 
 log_warning() {
+  write_log "WARN" "$*"
   if [[ "$JSON_ONLY" == "true" ]]; then
     return
   fi
@@ -164,10 +186,12 @@ log_warning() {
 }
 
 log_error() {
+  write_log "ERROR" "$*"
   echo -e "${RED}[ERROR]${NC} $*" >&2
 }
 
 log_verbose() {
+  write_log "DEBUG" "$*"
   if [[ "$VERBOSE" == "true" ]] || [[ "$DEBUG" == "true" ]]; then
     echo -e "${DIM}[verbose]${NC} $*" >&2
   fi
@@ -544,8 +568,22 @@ collect_sysinfo() {
   MEM_TYPE="unknown"
   MEM_SPEED=""
   if command -v dmidecode >/dev/null 2>&1; then
-    MEM_TYPE=$(run_as_root dmidecode -t memory 2>/dev/null | grep -m1 "Type:" | grep -v "Error" | awk '{print $2}' || echo "unknown")
-    MEM_SPEED=$(run_as_root dmidecode -t memory 2>/dev/null | grep -m1 "Speed:" | grep -v "Unknown" | awk '{print $2, $3}' || echo "")
+    local dmi_out
+    dmi_out=$(run_as_root dmidecode -t memory 2>/dev/null || echo "")
+    if [[ -n "$dmi_out" ]]; then
+      # Look for memory type (DDR4, DDR5, etc.) - skip "Error Correction Type" and similar
+      MEM_TYPE=$(echo "$dmi_out" | grep -E "^\s*Type:" | grep -v "Error" | grep -v "Unknown" | head -1 | awk '{print $2}' || echo "unknown")
+      [[ -z "$MEM_TYPE" ]] && MEM_TYPE="unknown"
+      
+      # Look for configured speed
+      MEM_SPEED=$(echo "$dmi_out" | grep -E "^\s*Configured Memory Speed:" | grep -v "Unknown" | head -1 | awk '{print $4, $5}' || echo "")
+      # Fallback to just "Speed:" if configured not found
+      if [[ -z "$MEM_SPEED" ]]; then
+        MEM_SPEED=$(echo "$dmi_out" | grep -E "^\s*Speed:" | grep -v "Unknown" | head -1 | awk '{print $2, $3}' || echo "")
+      fi
+      
+      log_verbose "Memory detection: type=$MEM_TYPE, speed=$MEM_SPEED"
+    fi
   fi
   
   # Kernel and OS
@@ -564,26 +602,57 @@ collect_sysinfo() {
     PROXMOX_VERSION=$(pveversion 2>/dev/null | head -1 || echo "")
   fi
   
-  # Disk info
+  # Disk info - detect the physical device underlying the mount
   ROOT_DEV="$(df "$DISK_PATH" 2>/dev/null | awk 'NR==2{print $1}')"
   DISK_MODEL=""
   DISK_TYPE="unknown"
   DISK_SIZE_GB=0
+  PHYSICAL_DEV=""
   
-  if [[ "$ROOT_DEV" == /dev/* ]]; then
+  # Resolve the actual physical device
+  if [[ "$ROOT_DEV" == /dev/mapper/* ]]; then
+    # LVM or device-mapper - try to find underlying physical device
+    local dm_name=$(basename "$ROOT_DEV")
+    if [[ -e "/sys/block/$dm_name/slaves" ]]; then
+      # Get first slave device (the physical volume)
+      local slave=$(ls "/sys/block/$dm_name/slaves" 2>/dev/null | head -1)
+      if [[ -n "$slave" ]]; then
+        # Recursively check if slave is also a dm device
+        while [[ -e "/sys/block/$slave/slaves" ]] && [[ -n "$(ls /sys/block/$slave/slaves 2>/dev/null)" ]]; do
+          slave=$(ls "/sys/block/$slave/slaves" 2>/dev/null | head -1)
+        done
+        PHYSICAL_DEV="/dev/$slave"
+      fi
+    fi
+    # Try lsblk as fallback
+    if [[ -z "$PHYSICAL_DEV" ]] && command -v lsblk >/dev/null 2>&1; then
+      PHYSICAL_DEV=$(lsblk -no PKNAME "$ROOT_DEV" 2>/dev/null | head -1)
+      [[ -n "$PHYSICAL_DEV" ]] && PHYSICAL_DEV="/dev/$PHYSICAL_DEV"
+    fi
+    log_verbose "LVM device $ROOT_DEV -> physical device: ${PHYSICAL_DEV:-unknown}"
+  elif [[ "$ROOT_DEV" == /dev/* ]]; then
+    PHYSICAL_DEV="$ROOT_DEV"
+  fi
+  
+  if [[ -n "$PHYSICAL_DEV" ]]; then
     # Strip partition number (handles nvme0n1p1 and sda1 formats)
-    if [[ "$ROOT_DEV" =~ nvme ]]; then
-      BASE_DEV="$(echo "$ROOT_DEV" | sed 's/p[0-9]*$//')"
+    if [[ "$PHYSICAL_DEV" =~ nvme ]]; then
+      BASE_DEV="$(echo "$PHYSICAL_DEV" | sed 's/p[0-9]*$//')"
       DISK_TYPE="nvme"
     else
-      BASE_DEV="$(echo "$ROOT_DEV" | sed 's/[0-9]*$//')"
+      BASE_DEV="$(echo "$PHYSICAL_DEV" | sed 's/[0-9]*$//')"
     fi
     
     DEV_NAME=$(basename "$BASE_DEV")
+    log_verbose "Base device: $BASE_DEV ($DEV_NAME)"
     
     # Get disk model
     if [[ -e "/sys/block/${DEV_NAME}/device/model" ]]; then
-      DISK_MODEL="$(cat "/sys/block/${DEV_NAME}/device/model" 2>/dev/null | tr -d ' \t\n' || echo "")"
+      DISK_MODEL="$(cat "/sys/block/${DEV_NAME}/device/model" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || echo "")"
+    fi
+    # Try nvme id-ctrl for NVMe devices
+    if [[ -z "$DISK_MODEL" ]] && [[ "$DISK_TYPE" == "nvme" ]] && command -v nvme >/dev/null 2>&1; then
+      DISK_MODEL=$(run_as_root nvme id-ctrl "$BASE_DEV" 2>/dev/null | grep -m1 "^mn " | awk '{$1=""; print $0}' | sed 's/^[[:space:]]*//' || echo "")
     fi
     
     # Get disk size
@@ -603,6 +672,8 @@ collect_sysinfo() {
         fi
       fi
     fi
+    
+    log_verbose "Disk detection: model=$DISK_MODEL, type=$DISK_TYPE, size=${DISK_SIZE_GB}GB"
   fi
   
   # Build JSON
@@ -1108,6 +1179,10 @@ print_summary() {
   
   # File paths
   echo -e "${DIM}📁 JSON saved:${NC} $RESULT_JSON"
+  if [[ "$DEBUG" == "true" ]]; then
+    echo -e "${DIM}📋 Log file:${NC} $LOG_FILE"
+    echo -e "${DIM}🔍 Debug file:${NC} $DEBUG_FILE"
+  fi
   echo -e "${DIM}🌐 Result URL:${NC} ${YELLOW}(coming soon - proxmark.io)${NC}"
   echo
 }
@@ -1135,6 +1210,54 @@ upload_results() {
 
 # === Main ===
 
+init_logging() {
+  # Initialize log file with header
+  {
+    echo "=========================================="
+    echo "Proxmark v$VERSION - Benchmark Log"
+    echo "Started: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "Run ID: $RUN_UUID"
+    echo "=========================================="
+  } > "$LOG_FILE" 2>/dev/null || true
+  
+  # Initialize debug file if in debug mode
+  if [[ "$DEBUG" == "true" ]]; then
+    {
+      echo "=========================================="
+      echo "Proxmark v$VERSION - Debug Log"
+      echo "Started: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "Run ID: $RUN_UUID"
+      echo "=========================================="
+      echo ""
+      echo "=== System Information ==="
+      echo "Hostname: $(hostname)"
+      echo "Kernel: $(uname -r)"
+      echo "OS: $(cat /etc/os-release 2>/dev/null | head -5)"
+      echo ""
+      echo "=== CPU Info ==="
+      head -30 /proc/cpuinfo 2>/dev/null || true
+      echo ""
+      echo "=== Memory Info ==="
+      cat /proc/meminfo 2>/dev/null | head -20 || true
+      echo ""
+      echo "=== Block Devices ==="
+      lsblk 2>/dev/null || true
+      echo ""
+      echo "=== Disk Free ==="
+      df -h 2>/dev/null || true
+      echo ""
+      echo "=== Mount Points ==="
+      mount 2>/dev/null | grep -E '^/dev' || true
+      echo ""
+      echo "=== DMI Memory ==="
+      dmidecode -t memory 2>/dev/null | head -50 || echo "(dmidecode not available or no permission)"
+      echo ""
+      echo "=========================================="
+      echo ""
+    } > "$DEBUG_FILE" 2>/dev/null || true
+  fi
+}
+
 main() {
   parse_args "$@"
   
@@ -1147,6 +1270,9 @@ main() {
     echo "proxmark v$VERSION"
     exit 0
   fi
+  
+  # Initialize logging first
+  init_logging
   
   print_banner
   debug_system_info

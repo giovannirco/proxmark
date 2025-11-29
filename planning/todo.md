@@ -40,7 +40,10 @@
 - [x] Disk size
 - [x] Virtualization platform detection
 - [x] Proxmox version detection
-- [ ] Memory type detection (DDR4/DDR5) - best effort
+- [x] Memory type detection (DDR4/DDR5) - best effort
+- [x] Memory speed detection
+- [x] CPU base/max frequency detection
+- [x] LVM/device-mapper disk resolution
 - [ ] Proxmox cluster info (if clustered)
 - [ ] Storage configuration (local, ZFS, Ceph, etc.)
 
@@ -102,6 +105,8 @@
 - [x] Save to /tmp with timestamp
 - [x] Custom output path (`--output`)
 - [x] Include run UUID for tracking
+- [x] Log file output (proxmark-*.log)
+- [x] Debug file output (proxmark-*.debug) with --debug
 - [ ] Pretty-print option (`--pretty`)
 
 #### Score Calculation
@@ -132,12 +137,12 @@
 - [ ] Clear error messages for common issues
 
 ### 1.6 Testing
-- [ ] Test on Proxmox VE 9.x
+- [x] Test on Proxmox VE 9.x (v1.0.4 verified)
 - [ ] Test on Proxmox VE 8.x
-- [ ] Test on fresh Proxmox install
-- [ ] Test from Proxmox web UI shell
-- [ ] Test via SSH
-- [ ] Test with pre-installed dependencies
+- [x] Test on fresh Proxmox install
+- [x] Test from Proxmox web UI shell
+- [x] Test via SSH
+- [x] Test with pre-installed dependencies
 
 ---
 
