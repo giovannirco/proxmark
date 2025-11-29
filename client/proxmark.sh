@@ -628,6 +628,7 @@ check_dependencies() {
   require_cmd_or_install sysbench sysbench
   require_cmd_or_install fio fio
   require_cmd_or_install jq jq
+  require_cmd_or_install lshw lshw
   
   # Check for libaio (needed for fio with libaio engine)
   if [[ "$PKG_MANAGER" == "apt" ]] && ! dpkg -l 2>/dev/null | grep -q libaio; then
@@ -645,12 +646,57 @@ collect_sysinfo() {
   
   HOSTNAME="$(hostname)"
   
-  # CPU info
+  # CPU info from /proc/cpuinfo (basic)
   CPU_MODEL="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//' || echo 'Unknown')"
   CPU_CORES="$(nproc --all)"
   CPU_THREADS="$(grep -c ^processor /proc/cpuinfo 2>/dev/null || echo "$CPU_CORES")"
   CPU_SOCKETS="$(grep 'physical id' /proc/cpuinfo | sort -u | wc -l)"
   [[ "$CPU_SOCKETS" -eq 0 ]] && CPU_SOCKETS=1
+  
+  # Additional CPU info
+  CPU_VENDOR=""
+  CPU_SOCKET=""
+  CPU_ARCH=""
+  CPU_CACHE_L1=""
+  CPU_CACHE_L2=""
+  CPU_CACHE_L3=""
+  
+  # Use lshw for detailed CPU info
+  if command -v lshw >/dev/null 2>&1; then
+    local lshw_cpu
+    lshw_cpu=$(run_as_root lshw -C cpu 2>/dev/null || echo "")
+    local lshw_cache
+    lshw_cache=$(run_as_root lshw -C memory 2>/dev/null | grep -A5 "cache" || echo "")
+    
+    if [[ -n "$lshw_cpu" ]]; then
+      # Extract vendor
+      CPU_VENDOR=$(echo "$lshw_cpu" | grep "vendor:" | head -1 | sed 's/.*vendor: //' | sed 's/\[.*\]//' | xargs)
+      
+      # Extract socket type (slot)
+      CPU_SOCKET=$(echo "$lshw_cpu" | grep "slot:" | head -1 | sed 's/.*slot: //')
+      
+      # Extract architecture (width)
+      local width=$(echo "$lshw_cpu" | grep "width:" | head -1 | sed 's/.*width: //')
+      [[ -n "$width" ]] && CPU_ARCH="$width"
+    fi
+    
+    # Extract cache info from lshw memory output
+    if [[ -n "$lshw_cache" ]]; then
+      CPU_CACHE_L1=$(run_as_root lshw -C memory 2>/dev/null | grep -A3 "L1" | grep "size:" | head -1 | sed 's/.*size: //')
+      CPU_CACHE_L2=$(run_as_root lshw -C memory 2>/dev/null | grep -A3 "L2" | grep "size:" | head -1 | sed 's/.*size: //')
+      CPU_CACHE_L3=$(run_as_root lshw -C memory 2>/dev/null | grep -A3 "L3" | grep "size:" | head -1 | sed 's/.*size: //')
+    fi
+  fi
+  
+  # Fallback vendor detection from /proc/cpuinfo
+  if [[ -z "$CPU_VENDOR" ]]; then
+    local vendor_id=$(grep -m1 'vendor_id' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')
+    case "$vendor_id" in
+      GenuineIntel) CPU_VENDOR="Intel" ;;
+      AuthenticAMD) CPU_VENDOR="AMD" ;;
+      *) CPU_VENDOR="$vendor_id" ;;
+    esac
+  fi
   
   # CPU frequency detection (base and max/boost)
   CPU_FREQ_BASE_MHZ=""
@@ -677,69 +723,153 @@ collect_sysinfo() {
     CPU_FREQ_MAX_MHZ=$(grep -m1 "cpu MHz" /proc/cpuinfo | awk '{printf "%.0f", $4}')
   fi
   
+  log_verbose "CPU: vendor=$CPU_VENDOR, socket=$CPU_SOCKET, arch=$CPU_ARCH, L1=$CPU_CACHE_L1, L2=$CPU_CACHE_L2, L3=$CPU_CACHE_L3"
+  
   # Memory info
   MEM_TOTAL_KB="$(grep MemTotal /proc/meminfo | awk '{print $2}')"
   MEM_TOTAL_MB=$((MEM_TOTAL_KB / 1024))
   MEM_TOTAL_GB=$((MEM_TOTAL_MB / 1024))
   
-  # Try to detect memory type, speed, and channel config (best effort)
+  # Memory detection using lshw (preferred) or dmidecode fallback
   MEM_TYPE="unknown"
   MEM_SPEED=""
   MEM_CHANNELS=""
   MEM_SLOTS_USED=0
   MEM_SLOTS_TOTAL=0
   MEM_ECC=""
+  MEM_FORM_FACTOR=""
+  MEM_BANKS=()  # Array to store per-bank info
+  MEM_BANKS_JSON="[]"
   
-  if command -v dmidecode >/dev/null 2>&1; then
+  if command -v lshw >/dev/null 2>&1; then
+    local lshw_mem
+    lshw_mem=$(run_as_root lshw -C memory 2>/dev/null || echo "")
+    
+    if [[ -n "$lshw_mem" ]]; then
+      # Parse memory banks from lshw output
+      local bank_idx=0
+      local in_bank=false
+      local bank_desc="" bank_product="" bank_vendor="" bank_slot="" bank_size="" bank_clock=""
+      
+      while IFS= read -r line; do
+        if echo "$line" | grep -q "^\s*\*-bank"; then
+          # Save previous bank if exists
+          if [[ "$in_bank" == true ]] && [[ -n "$bank_size" ]] && [[ "$bank_size" != "[empty]" ]]; then
+            MEM_BANKS+=("$bank_slot|$bank_size|$bank_vendor|$bank_product|$bank_clock")
+            ((MEM_SLOTS_USED++))
+          fi
+          in_bank=true
+          bank_desc="" bank_product="" bank_vendor="" bank_slot="" bank_size="" bank_clock=""
+          ((MEM_SLOTS_TOTAL++))
+        elif [[ "$in_bank" == true ]]; then
+          if echo "$line" | grep -q "description:"; then
+            bank_desc=$(echo "$line" | sed 's/.*description: //')
+            # Extract form factor and type from description
+            if echo "$bank_desc" | grep -qi "SODIMM"; then
+              MEM_FORM_FACTOR="SODIMM"
+            elif echo "$bank_desc" | grep -qi "DIMM"; then
+              MEM_FORM_FACTOR="DIMM"
+            fi
+            if echo "$bank_desc" | grep -qi "DDR5"; then
+              MEM_TYPE="DDR5"
+            elif echo "$bank_desc" | grep -qi "DDR4"; then
+              MEM_TYPE="DDR4"
+            elif echo "$bank_desc" | grep -qi "DDR3"; then
+              MEM_TYPE="DDR3"
+            fi
+            # Check for ECC/Unbuffered
+            if echo "$bank_desc" | grep -qi "Unbuffered"; then
+              MEM_ECC="Non-ECC"
+            elif echo "$bank_desc" | grep -qi "Registered\|ECC"; then
+              MEM_ECC="ECC"
+            fi
+          elif echo "$line" | grep -q "product:"; then
+            bank_product=$(echo "$line" | sed 's/.*product: //')
+          elif echo "$line" | grep -q "vendor:"; then
+            bank_vendor=$(echo "$line" | sed 's/.*vendor: //')
+          elif echo "$line" | grep -q "slot:"; then
+            bank_slot=$(echo "$line" | sed 's/.*slot: //')
+          elif echo "$line" | grep -q "size:"; then
+            bank_size=$(echo "$line" | sed 's/.*size: //')
+          elif echo "$line" | grep -q "clock:"; then
+            bank_clock=$(echo "$line" | sed 's/.*clock: //' | awk '{print $1}')
+            [[ -z "$MEM_SPEED" ]] && MEM_SPEED="${bank_clock}"
+          fi
+        fi
+      done <<< "$lshw_mem"
+      
+      # Save last bank
+      if [[ "$in_bank" == true ]] && [[ -n "$bank_size" ]] && [[ "$bank_size" != "[empty]" ]]; then
+        MEM_BANKS+=("$bank_slot|$bank_size|$bank_vendor|$bank_product|$bank_clock")
+        ((MEM_SLOTS_USED++))
+      fi
+      
+      # Build JSON array for memory banks
+      if [[ ${#MEM_BANKS[@]} -gt 0 ]]; then
+        MEM_BANKS_JSON="["
+        for i in "${!MEM_BANKS[@]}"; do
+          IFS='|' read -r slot size vendor product clock <<< "${MEM_BANKS[$i]}"
+          [[ $i -gt 0 ]] && MEM_BANKS_JSON+=","
+          MEM_BANKS_JSON+="{\"slot\":\"$slot\",\"size\":\"$size\",\"vendor\":\"$vendor\",\"product\":\"$product\",\"speed\":\"$clock\"}"
+        done
+        MEM_BANKS_JSON+="]"
+      fi
+    fi
+  fi
+  
+  # Fallback to dmidecode if lshw didn't provide enough info
+  if [[ "$MEM_TYPE" == "unknown" ]] && command -v dmidecode >/dev/null 2>&1; then
     local dmi_out
     dmi_out=$(run_as_root dmidecode -t memory 2>/dev/null || echo "")
     if [[ -n "$dmi_out" ]]; then
-      # Look for memory type (DDR4, DDR5, etc.) - skip "Error Correction Type" and similar
       MEM_TYPE=$(echo "$dmi_out" | grep -E "^\s*Type:" | grep -v "Error" | grep -v "Unknown" | head -1 | awk '{print $2}' || echo "unknown")
       [[ -z "$MEM_TYPE" ]] && MEM_TYPE="unknown"
       
-      # Look for configured speed
-      MEM_SPEED=$(echo "$dmi_out" | grep -E "^\s*Configured Memory Speed:" | grep -v "Unknown" | head -1 | awk '{print $4, $5}' || echo "")
-      # Fallback to just "Speed:" if configured not found
       if [[ -z "$MEM_SPEED" ]]; then
-        MEM_SPEED=$(echo "$dmi_out" | grep -E "^\s*Speed:" | grep -v "Unknown" | head -1 | awk '{print $2, $3}' || echo "")
+        MEM_SPEED=$(echo "$dmi_out" | grep -E "^\s*Configured Memory Speed:" | grep -v "Unknown" | head -1 | awk '{print $4}' || echo "")
+        [[ -z "$MEM_SPEED" ]] && MEM_SPEED=$(echo "$dmi_out" | grep -E "^\s*Speed:" | grep -v "Unknown" | head -1 | awk '{print $2}' || echo "")
       fi
       
-      # Check for ECC
-      local ecc_type=$(echo "$dmi_out" | grep -E "^\s*Error Correction Type:" | head -1 | awk '{print $4}' || echo "")
-      if [[ "$ecc_type" == "Single-bit" ]] || [[ "$ecc_type" == "Multi-bit" ]]; then
-        MEM_ECC="ECC"
-      elif [[ "$ecc_type" == "None" ]]; then
-        MEM_ECC="Non-ECC"
+      if [[ -z "$MEM_ECC" ]]; then
+        local ecc_type=$(echo "$dmi_out" | grep -E "^\s*Error Correction Type:" | head -1 | awk '{print $4}' || echo "")
+        if [[ "$ecc_type" == "Single-bit" ]] || [[ "$ecc_type" == "Multi-bit" ]]; then
+          MEM_ECC="ECC"
+        elif [[ "$ecc_type" == "None" ]]; then
+          MEM_ECC="Non-ECC"
+        fi
       fi
       
-      # Count memory slots and populated DIMMs
-      # Total slots = number of "Memory Device" sections
-      MEM_SLOTS_TOTAL=$(echo "$dmi_out" | grep -c "Memory Device" || echo 0)
-      # Populated = slots with actual size (not "No Module Installed")
-      MEM_SLOTS_USED=$(echo "$dmi_out" | grep -E "^\s*Size:" | grep -v "No Module" | grep -v "Unknown" | wc -l || echo 0)
-      
-      # Determine channel configuration based on populated slots
-      # This is a heuristic - actual channel config depends on motherboard
-      if [[ $MEM_SLOTS_USED -eq 1 ]]; then
-        MEM_CHANNELS="Single Channel"
-      elif [[ $MEM_SLOTS_USED -eq 2 ]]; then
-        MEM_CHANNELS="Dual Channel"
-      elif [[ $MEM_SLOTS_USED -eq 3 ]]; then
-        MEM_CHANNELS="Triple Channel"
-      elif [[ $MEM_SLOTS_USED -eq 4 ]]; then
-        MEM_CHANNELS="Quad Channel"
-      elif [[ $MEM_SLOTS_USED -eq 6 ]]; then
-        MEM_CHANNELS="Hexa Channel"
-      elif [[ $MEM_SLOTS_USED -eq 8 ]]; then
-        MEM_CHANNELS="Octa Channel"
-      elif [[ $MEM_SLOTS_USED -gt 8 ]]; then
-        MEM_CHANNELS="${MEM_SLOTS_USED}-DIMM"
+      if [[ $MEM_SLOTS_TOTAL -eq 0 ]]; then
+        MEM_SLOTS_TOTAL=$(echo "$dmi_out" | grep -c "Memory Device" || echo 0)
+        MEM_SLOTS_USED=$(echo "$dmi_out" | grep -E "^\s*Size:" | grep -v "No Module" | grep -v "Unknown" | wc -l || echo 0)
       fi
-      
-      log_verbose "Memory detection: type=$MEM_TYPE, speed=$MEM_SPEED, slots=${MEM_SLOTS_USED}/${MEM_SLOTS_TOTAL}, channels=$MEM_CHANNELS, ecc=$MEM_ECC"
     fi
   fi
+  
+  # Determine channel configuration
+  if [[ $MEM_SLOTS_USED -eq 1 ]]; then
+    MEM_CHANNELS="Single Channel"
+  elif [[ $MEM_SLOTS_USED -eq 2 ]]; then
+    MEM_CHANNELS="Dual Channel"
+  elif [[ $MEM_SLOTS_USED -eq 3 ]]; then
+    MEM_CHANNELS="Triple Channel"
+  elif [[ $MEM_SLOTS_USED -eq 4 ]]; then
+    MEM_CHANNELS="Quad Channel"
+  elif [[ $MEM_SLOTS_USED -eq 6 ]]; then
+    MEM_CHANNELS="Hexa Channel"
+  elif [[ $MEM_SLOTS_USED -eq 8 ]]; then
+    MEM_CHANNELS="Octa Channel"
+  elif [[ $MEM_SLOTS_USED -gt 8 ]]; then
+    MEM_CHANNELS="${MEM_SLOTS_USED}-DIMM"
+  fi
+  
+  # Add MT/s suffix if just a number
+  if [[ -n "$MEM_SPEED" ]] && [[ "$MEM_SPEED" =~ ^[0-9]+$ ]]; then
+    MEM_SPEED="${MEM_SPEED}MHz"
+  fi
+  
+  log_verbose "Memory detection: type=$MEM_TYPE, form=$MEM_FORM_FACTOR, speed=$MEM_SPEED, slots=${MEM_SLOTS_USED}/${MEM_SLOTS_TOTAL}, channels=$MEM_CHANNELS, ecc=$MEM_ECC"
+  log_verbose "Memory banks: ${MEM_BANKS[*]}"
   
   # Kernel and OS
   KERNEL="$(uname -r)"
@@ -908,18 +1038,26 @@ collect_sysinfo() {
   SYSINFO_JSON=$(jq -n \
     --arg host "$HOSTNAME" \
     --arg cpu_model "$CPU_MODEL" \
+    --arg cpu_vendor "${CPU_VENDOR:-}" \
+    --arg cpu_socket "${CPU_SOCKET:-}" \
+    --arg cpu_arch "${CPU_ARCH:-}" \
     --argjson cpu_cores "$CPU_CORES" \
     --argjson cpu_threads "$CPU_THREADS" \
     --argjson cpu_sockets "$CPU_SOCKETS" \
     --arg cpu_freq_base_mhz "${CPU_FREQ_BASE_MHZ:-}" \
     --arg cpu_freq_max_mhz "${CPU_FREQ_MAX_MHZ:-}" \
+    --arg cpu_cache_l1 "${CPU_CACHE_L1:-}" \
+    --arg cpu_cache_l2 "${CPU_CACHE_L2:-}" \
+    --arg cpu_cache_l3 "${CPU_CACHE_L3:-}" \
     --argjson mem_mb "$MEM_TOTAL_MB" \
     --arg mem_type "$MEM_TYPE" \
+    --arg mem_form "${MEM_FORM_FACTOR:-}" \
     --arg mem_speed "${MEM_SPEED:-}" \
     --arg mem_channels "${MEM_CHANNELS:-}" \
     --argjson mem_slots_used "${MEM_SLOTS_USED:-0}" \
     --argjson mem_slots_total "${MEM_SLOTS_TOTAL:-0}" \
     --arg mem_ecc "${MEM_ECC:-}" \
+    --argjson mem_banks "$MEM_BANKS_JSON" \
     --arg kernel "$KERNEL" \
     --arg os "$OS" \
     --arg virt "$VIRT_TYPE" \
@@ -939,20 +1077,32 @@ collect_sysinfo() {
     --arg disk_path "$DISK_PATH" \
     '{
       hostname: $host,
-      cpu_model: $cpu_model,
-      cpu_cores: $cpu_cores,
-      cpu_threads: $cpu_threads,
-      cpu_sockets: $cpu_sockets,
-      cpu_freq_base_mhz: $cpu_freq_base_mhz,
-      cpu_freq_max_mhz: $cpu_freq_max_mhz,
+      cpu: {
+        model: $cpu_model,
+        vendor: $cpu_vendor,
+        socket: $cpu_socket,
+        architecture: $cpu_arch,
+        cores: $cpu_cores,
+        threads: $cpu_threads,
+        sockets: $cpu_sockets,
+        freq_base_mhz: $cpu_freq_base_mhz,
+        freq_max_mhz: $cpu_freq_max_mhz,
+        cache: {
+          l1: $cpu_cache_l1,
+          l2: $cpu_cache_l2,
+          l3: $cpu_cache_l3
+        }
+      },
       memory: {
         total_mb: $mem_mb,
         type: $mem_type,
+        form_factor: $mem_form,
         speed: $mem_speed,
         channels: $mem_channels,
         slots_used: $mem_slots_used,
         slots_total: $mem_slots_total,
-        ecc: $mem_ecc
+        ecc: $mem_ecc,
+        banks: $mem_banks
       },
       kernel: $kernel,
       os: $os,
@@ -1055,27 +1205,52 @@ run_mem_benchmark() {
     --time="$lat_time" \
     --threads=1 run 2>&1)"
   
-  # Extract latency from sysbench output
-  # Format is: "avg:                                    X.XX"
-  local lat_avg_ms=$(echo "$out" | grep -A1 "Latency (ms)" | grep "avg:" | awk '{print $NF}' || echo "0")
+  log_verbose "Sysbench latency output: $out"
   
-  # If that didn't work, try alternative parsing
-  if [[ -z "$lat_avg_ms" || "$lat_avg_ms" == "0" ]]; then
-    lat_avg_ms=$(echo "$out" | awk '/avg:/{gsub(/[^0-9.]/,"",$NF); print $NF}' | head -1 || echo "0")
+  # Extract latency from sysbench output - try multiple patterns
+  local lat_avg_ms=""
+  
+  # Pattern 1: Look for "avg:" line after "Latency (ms):"
+  lat_avg_ms=$(echo "$out" | grep -A4 "Latency" | grep "avg:" | awk '{print $NF}' | head -1)
+  
+  # Pattern 2: Try awk on the whole output
+  if [[ -z "$lat_avg_ms" || "$lat_avg_ms" == "0.00" ]]; then
+    lat_avg_ms=$(echo "$out" | awk '/avg:/ {print $NF}' | head -1)
   fi
   
-  # Calculate operations per second for latency estimation
-  # If sysbench latency is too low to measure, estimate from ops/sec
-  if [[ "$lat_avg_ms" == "0" || "$lat_avg_ms" == "0.00" ]]; then
-    local ops_per_sec=$(echo "$out" | awk '/Total operations:.*per second/ {gsub(/[()]/,"",$NF); print $(NF-1)}' || echo "0")
-    if [[ -n "$ops_per_sec" ]] && [[ "$ops_per_sec" != "0" ]]; then
-      # Latency in microseconds = 1,000,000 / ops_per_sec
-      lat_avg_ms=$(awk "BEGIN {printf \"%.4f\", 1000 / $ops_per_sec}")
+  # Pattern 3: Calculate from throughput - sysbench shows "X MiB/sec" or "X.XX MiB transferred"
+  # Latency (ns) ≈ block_size / (throughput_bytes_per_sec)
+  if [[ -z "$lat_avg_ms" || "$lat_avg_ms" == "0.00" || "$lat_avg_ms" == "0" ]]; then
+    # Get MiB/sec from output
+    local mib_per_sec=$(echo "$out" | grep -oE '[0-9]+\.[0-9]+ MiB/sec' | awk '{print $1}' | head -1)
+    if [[ -n "$mib_per_sec" ]] && [[ "$mib_per_sec" != "0" ]]; then
+      # block_size = 64 bytes, throughput in bytes/sec = MiB/sec * 1048576
+      # time_per_op_ns = 64 / (mib_per_sec * 1048576) * 1e9
+      # time_per_op_ms = 64 / (mib_per_sec * 1048576) * 1000
+      lat_avg_ms=$(awk "BEGIN {printf \"%.6f\", 64 / ($mib_per_sec * 1048576) * 1000}")
     fi
   fi
   
+  # Fallback: use total time / total operations
+  if [[ -z "$lat_avg_ms" || "$lat_avg_ms" == "0" ]]; then
+    local total_ops=$(echo "$out" | grep "Total operations:" | awk '{print $3}')
+    local total_time=$(echo "$out" | grep "total time:" | awk '{print $3}' | sed 's/s//')
+    if [[ -n "$total_ops" && -n "$total_time" && "$total_ops" != "0" ]]; then
+      lat_avg_ms=$(awk "BEGIN {if ($total_ops > 0) printf \"%.6f\", ($total_time * 1000) / $total_ops; else print \"0\"}")
+    fi
+  fi
+  
+  # Ensure we have a valid number
+  if [[ -z "$lat_avg_ms" ]] || ! [[ "$lat_avg_ms" =~ ^[0-9.]+$ ]]; then
+    lat_avg_ms="0"
+  fi
+  
   MEM_LATENCY_MS="$lat_avg_ms"
-  MEM_LATENCY_NS=$(awk "BEGIN {printf \"%.0f\", $lat_avg_ms * 1000000}")
+  if [[ "$lat_avg_ms" != "0" ]]; then
+    MEM_LATENCY_NS=$(awk "BEGIN {printf \"%.0f\", $lat_avg_ms * 1000000}")
+  else
+    MEM_LATENCY_NS="0"
+  fi
   
   log_success "Memory latency: ${lat_avg_ms} ms avg"
 }
@@ -1567,13 +1742,24 @@ print_summary() {
   echo -e "${BOLD}${YELLOW}CPU${NC}"
   echo -e "${DIM}────────────────────────────────────────────────────────────────────────────${NC}"
   echo -e "  ${BOLD}Model:${NC}        $CPU_MODEL"
+  [[ -n "$CPU_VENDOR" ]] && echo -e "  ${BOLD}Vendor:${NC}       $CPU_VENDOR"
   echo -e "  ${BOLD}Cores:${NC}        $CPU_CORES cores / $CPU_THREADS threads"
   echo -e "  ${BOLD}Sockets:${NC}      $CPU_SOCKETS"
+  [[ -n "$CPU_SOCKET" ]] && echo -e "  ${BOLD}Socket:${NC}       $CPU_SOCKET"
+  [[ -n "$CPU_ARCH" ]] && echo -e "  ${BOLD}Architecture:${NC} $CPU_ARCH"
   if [[ -n "$CPU_FREQ_BASE_MHZ" && "$CPU_FREQ_BASE_MHZ" != "0" ]]; then
     echo -e "  ${BOLD}Base Freq:${NC}    ${CPU_FREQ_BASE_MHZ} MHz"
   fi
   if [[ -n "$CPU_FREQ_MAX_MHZ" && "$CPU_FREQ_MAX_MHZ" != "0" ]]; then
     echo -e "  ${BOLD}Max Freq:${NC}     ${CPU_FREQ_MAX_MHZ} MHz"
+  fi
+  # Cache info
+  if [[ -n "$CPU_CACHE_L1" || -n "$CPU_CACHE_L2" || -n "$CPU_CACHE_L3" ]]; then
+    local cache_info=""
+    [[ -n "$CPU_CACHE_L1" ]] && cache_info+="L1: $CPU_CACHE_L1"
+    [[ -n "$CPU_CACHE_L2" ]] && cache_info+="${cache_info:+, }L2: $CPU_CACHE_L2"
+    [[ -n "$CPU_CACHE_L3" ]] && cache_info+="${cache_info:+, }L3: $CPU_CACHE_L3"
+    echo -e "  ${BOLD}Cache:${NC}        $cache_info"
   fi
   echo
   
@@ -1584,11 +1770,26 @@ print_summary() {
   echo -e "  ${BOLD}Total:${NC}        ${mem_gb} GB (${MEM_TOTAL_MB} MB)"
   if [[ "$MEM_TYPE" != "unknown" && -n "$MEM_TYPE" ]]; then
     local mem_type_display="$MEM_TYPE"
-    [[ -n "$MEM_ECC" ]] && mem_type_display="$MEM_TYPE $MEM_ECC"
+    [[ -n "$MEM_FORM_FACTOR" ]] && mem_type_display="$MEM_FORM_FACTOR $MEM_TYPE"
+    [[ -n "$MEM_ECC" ]] && mem_type_display="$mem_type_display $MEM_ECC"
     echo -e "  ${BOLD}Type:${NC}         $mem_type_display"
   fi
   [[ -n "$MEM_SPEED" ]] && echo -e "  ${BOLD}Speed:${NC}        $MEM_SPEED"
   [[ -n "$MEM_CHANNELS" ]] && echo -e "  ${BOLD}Config:${NC}       $MEM_CHANNELS (${MEM_SLOTS_USED}/${MEM_SLOTS_TOTAL} slots)"
+  
+  # Show per-bank details if available
+  if [[ ${#MEM_BANKS[@]} -gt 0 ]]; then
+    echo -e "  ${BOLD}Banks:${NC}"
+    for bank_info in "${MEM_BANKS[@]}"; do
+      IFS='|' read -r slot size vendor product clock <<< "$bank_info"
+      local bank_detail="    ${slot}: ${size}"
+      [[ -n "$vendor" && "$vendor" != "Unknown" ]] && bank_detail+=" ($vendor"
+      [[ -n "$product" && "$product" != "Unknown" ]] && bank_detail+=" $product"
+      [[ -n "$vendor" && "$vendor" != "Unknown" ]] && bank_detail+=")"
+      [[ -n "$clock" ]] && bank_detail+=" @ ${clock}"
+      echo -e "$bank_detail"
+    done
+  fi
   echo
   
   # Disk info section
