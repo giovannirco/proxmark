@@ -13,7 +13,7 @@
 set -euo pipefail
 
 # === Version ===
-VERSION="1.0.2"
+VERSION="1.0.3"
 
 # === Colors ===
 RED='\033[0;31m'
@@ -492,15 +492,26 @@ collect_sysinfo() {
   CPU_SOCKETS="$(grep 'physical id' /proc/cpuinfo | sort -u | wc -l)"
   [[ "$CPU_SOCKETS" -eq 0 ]] && CPU_SOCKETS=1
   
+  # CPU frequency detection
+  CPU_FREQ_MHZ=""
+  if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq ]]; then
+    local freq_khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null || echo 0)
+    CPU_FREQ_MHZ=$((freq_khz / 1000))
+  elif grep -q "cpu MHz" /proc/cpuinfo; then
+    CPU_FREQ_MHZ=$(grep -m1 "cpu MHz" /proc/cpuinfo | awk '{printf "%.0f", $4}')
+  fi
+  
   # Memory info
   MEM_TOTAL_KB="$(grep MemTotal /proc/meminfo | awk '{print $2}')"
   MEM_TOTAL_MB=$((MEM_TOTAL_KB / 1024))
   MEM_TOTAL_GB=$((MEM_TOTAL_MB / 1024))
   
-  # Try to detect memory type (best effort)
+  # Try to detect memory type and speed (best effort)
   MEM_TYPE="unknown"
-  if command -v dmidecode >/dev/null 2>&1 && [[ -r /dev/mem ]]; then
-    MEM_TYPE=$(run_as_root dmidecode -t memory 2>/dev/null | grep -m1 "Type:" | awk '{print $2}' || echo "unknown")
+  MEM_SPEED=""
+  if command -v dmidecode >/dev/null 2>&1; then
+    MEM_TYPE=$(run_as_root dmidecode -t memory 2>/dev/null | grep -m1 "Type:" | grep -v "Error" | awk '{print $2}' || echo "unknown")
+    MEM_SPEED=$(run_as_root dmidecode -t memory 2>/dev/null | grep -m1 "Speed:" | grep -v "Unknown" | awk '{print $2, $3}' || echo "")
   fi
   
   # Kernel and OS
@@ -567,8 +578,10 @@ collect_sysinfo() {
     --argjson cpu_cores "$CPU_CORES" \
     --argjson cpu_threads "$CPU_THREADS" \
     --argjson cpu_sockets "$CPU_SOCKETS" \
+    --arg cpu_freq_mhz "${CPU_FREQ_MHZ:-}" \
     --argjson mem_mb "$MEM_TOTAL_MB" \
     --arg mem_type "$MEM_TYPE" \
+    --arg mem_speed "${MEM_SPEED:-}" \
     --arg kernel "$KERNEL" \
     --arg os "$OS" \
     --arg virt "$VIRT_TYPE" \
@@ -578,14 +591,17 @@ collect_sysinfo() {
     --arg disk_model "$DISK_MODEL" \
     --arg disk_type "$DISK_TYPE" \
     --argjson disk_size_gb "$DISK_SIZE_GB" \
+    --arg disk_path "$DISK_PATH" \
     '{
       hostname: $host,
       cpu_model: $cpu_model,
       cpu_cores: $cpu_cores,
       cpu_threads: $cpu_threads,
       cpu_sockets: $cpu_sockets,
+      cpu_freq_mhz: $cpu_freq_mhz,
       mem_total_mb: $mem_mb,
       mem_type: $mem_type,
+      mem_speed: $mem_speed,
       kernel: $kernel,
       os: $os,
       virtualization: $virt,
@@ -594,7 +610,8 @@ collect_sysinfo() {
       root_device: $root_dev,
       disk_model: $disk_model,
       disk_type: $disk_type,
-      disk_size_gb: $disk_size_gb
+      disk_size_gb: $disk_size_gb,
+      disk_path: $disk_path
     }')
   
   log_success "System info collected"
@@ -974,43 +991,79 @@ print_summary() {
   fi
   
   echo
-  echo -e "${CYAN}╭──────────────────────────────────────────────────────────────╮${NC}"
-  echo -e "${CYAN}│${NC}${BOLD}                   BENCHMARK RESULTS                          ${NC}${CYAN}│${NC}"
-  echo -e "${CYAN}╰──────────────────────────────────────────────────────────────╯${NC}"
+  echo -e "${CYAN}╭──────────────────────────────────────────────────────────────────────────╮${NC}"
+  echo -e "${CYAN}│${NC}${BOLD}                         BENCHMARK RESULTS                                ${NC}${CYAN}│${NC}"
+  echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────────────╯${NC}"
   echo
   
-  # System info
-  local cpu_info="$(echo "$SYSINFO_JSON" | jq -r '.cpu_model') ($(echo "$SYSINFO_JSON" | jq -r '.cpu_cores') cores)"
+  # System info section
+  echo -e "${BOLD}${YELLOW}SYSTEM INFORMATION${NC}"
+  echo -e "${DIM}────────────────────────────────────────────────────────────────────────────${NC}"
+  echo -e "  ${BOLD}Hostname:${NC}     $HOSTNAME"
+  echo -e "  ${BOLD}OS:${NC}           $OS"
+  echo -e "  ${BOLD}Kernel:${NC}       $KERNEL"
+  [[ -n "$PROXMOX_VERSION" ]] && echo -e "  ${BOLD}Proxmox:${NC}      $PROXMOX_VERSION"
+  echo
+  
+  # CPU info section
+  echo -e "${BOLD}${YELLOW}CPU${NC}"
+  echo -e "${DIM}────────────────────────────────────────────────────────────────────────────${NC}"
+  echo -e "  ${BOLD}Model:${NC}        $CPU_MODEL"
+  echo -e "  ${BOLD}Cores:${NC}        $CPU_CORES cores / $CPU_THREADS threads"
+  echo -e "  ${BOLD}Sockets:${NC}      $CPU_SOCKETS"
+  [[ -n "$CPU_FREQ_MHZ" && "$CPU_FREQ_MHZ" != "0" ]] && echo -e "  ${BOLD}Max Freq:${NC}     ${CPU_FREQ_MHZ} MHz"
+  echo
+  
+  # Memory info section
   local mem_gb=$((MEM_TOTAL_MB / 1024))
-  local disk_info="$(echo "$SYSINFO_JSON" | jq -r '.disk_model // "unknown"') ($(echo "$SYSINFO_JSON" | jq -r '.disk_type'))"
-  
-  echo -e "${BOLD}System:${NC} $HOSTNAME | $cpu_info | ${mem_gb}GB RAM"
-  echo -e "${BOLD}OS:${NC} $OS | Kernel: $KERNEL"
-  [[ -n "$PROXMOX_VERSION" ]] && echo -e "${BOLD}Proxmox:${NC} $PROXMOX_VERSION"
-  echo -e "${BOLD}Disk:${NC} $disk_info"
+  echo -e "${BOLD}${YELLOW}MEMORY${NC}"
+  echo -e "${DIM}────────────────────────────────────────────────────────────────────────────${NC}"
+  echo -e "  ${BOLD}Total:${NC}        ${mem_gb} GB (${MEM_TOTAL_MB} MB)"
+  [[ "$MEM_TYPE" != "unknown" && -n "$MEM_TYPE" ]] && echo -e "  ${BOLD}Type:${NC}         $MEM_TYPE"
+  [[ -n "$MEM_SPEED" ]] && echo -e "  ${BOLD}Speed:${NC}        $MEM_SPEED"
   echo
   
-  # Results table
-  echo -e "${DIM}┌────────────┬──────────────────────┬──────────────┬─────────┐${NC}"
-  echo -e "${DIM}│${NC}${BOLD} Test       ${DIM}│${NC}${BOLD} Metric               ${DIM}│${NC}${BOLD} Value        ${DIM}│${NC}${BOLD} Score   ${DIM}│${NC}"
-  echo -e "${DIM}├────────────┼──────────────────────┼──────────────┼─────────┤${NC}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-20s ${DIM}│${NC} %12s ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "CPU" "multi-thread (ev/s)" "${CPU_MULTI_EPS}" "${SCORE_CPU_MULTI}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-20s ${DIM}│${NC} %12s ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "CPU" "single-thread (ev/s)" "${CPU_SINGLE_EPS}" "${SCORE_CPU_SINGLE}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-20s ${DIM}│${NC} %12s ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "Memory" "write (MB/s)" "${MEM_WRITE_MBS}" "${SCORE_MEMORY}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-20s ${DIM}│${NC} %12s ${DIM}│${NC}         ${DIM}│${NC}\n" "Memory" "read (MB/s)" "${MEM_READ_MBS}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-20s ${DIM}│${NC} %12s ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "Disk" "rand r/w IOPS" "${DISK_RANDRW_IOPS_TOTAL}" "${SCORE_DISK_IOPS}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-20s ${DIM}│${NC} %12s ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "Disk" "seq read (MB/s)" "${DISK_SEQ_READ_MB}" "${SCORE_DISK_BW}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-20s ${DIM}│${NC} %12s ${DIM}│${NC}         ${DIM}│${NC}\n" "Disk" "seq write (MB/s)" "${DISK_SEQ_WRITE_MB}"
-  echo -e "${DIM}└────────────┴──────────────────────┴──────────────┴─────────┘${NC}"
+  # Disk info section
+  local disk_model=$(echo "$SYSINFO_JSON" | jq -r '.disk_model // "Unknown"')
+  local disk_type=$(echo "$SYSINFO_JSON" | jq -r '.disk_type // "unknown"')
+  local disk_size=$(echo "$SYSINFO_JSON" | jq -r '.disk_size_gb // 0')
+  echo -e "${BOLD}${YELLOW}STORAGE${NC}"
+  echo -e "${DIM}────────────────────────────────────────────────────────────────────────────${NC}"
+  echo -e "  ${BOLD}Test Path:${NC}    $DISK_PATH"
+  echo -e "  ${BOLD}Device:${NC}       $(echo "$SYSINFO_JSON" | jq -r '.root_device // "Unknown"')"
+  [[ -n "$disk_model" && "$disk_model" != "Unknown" && "$disk_model" != "" ]] && echo -e "  ${BOLD}Model:${NC}        $disk_model"
+  echo -e "  ${BOLD}Type:${NC}         ${disk_type^^}"
+  [[ "$disk_size" -gt 0 ]] && echo -e "  ${BOLD}Size:${NC}         ${disk_size} GB"
   echo
   
-  # Total score
-  echo -e "                            ${BOLD}${CYAN}TOTAL SCORE: ${GREEN}${SCORE_TOTAL}${NC}"
+  # Benchmark Results section
+  echo -e "${BOLD}${YELLOW}BENCHMARK RESULTS${NC}"
+  echo -e "${DIM}────────────────────────────────────────────────────────────────────────────${NC}"
+  echo
+  echo -e "${DIM}┌────────────┬────────────────────────┬──────────────┬─────────┐${NC}"
+  echo -e "${DIM}│${NC}${BOLD} Component  ${DIM}│${NC}${BOLD} Metric                 ${DIM}│${NC}${BOLD} Value        ${DIM}│${NC}${BOLD} Score   ${DIM}│${NC}"
+  echo -e "${DIM}├────────────┼────────────────────────┼──────────────┼─────────┤${NC}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-22s ${DIM}│${NC} %12s ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "CPU" "Multi-thread (ev/s)" "${CPU_MULTI_EPS}" "${SCORE_CPU_MULTI}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-22s ${DIM}│${NC} %12s ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "CPU" "Single-thread (ev/s)" "${CPU_SINGLE_EPS}" "${SCORE_CPU_SINGLE}"
+  echo -e "${DIM}├────────────┼────────────────────────┼──────────────┼─────────┤${NC}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-22s ${DIM}│${NC} %12s ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "Memory" "Write (MB/s)" "${MEM_WRITE_MBS}" "${SCORE_MEMORY}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-22s ${DIM}│${NC} %12s ${DIM}│${NC}         ${DIM}│${NC}\n" "Memory" "Read (MB/s)" "${MEM_READ_MBS}"
+  echo -e "${DIM}├────────────┼────────────────────────┼──────────────┼─────────┤${NC}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-22s ${DIM}│${NC} %12s ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "Disk" "4K Random R/W (IOPS)" "${DISK_RANDRW_IOPS_TOTAL}" "${SCORE_DISK_IOPS}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-22s ${DIM}│${NC} %12s ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "Disk" "Seq Read (MB/s)" "${DISK_SEQ_READ_MB}" "${SCORE_DISK_BW}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-22s ${DIM}│${NC} %12s ${DIM}│${NC}         ${DIM}│${NC}\n" "Disk" "Seq Write (MB/s)" "${DISK_SEQ_WRITE_MB}"
+  echo -e "${DIM}└────────────┴────────────────────────┴──────────────┴─────────┘${NC}"
+  echo
+  
+  # Total score - make it stand out
+  echo -e "${CYAN}╭──────────────────────────────────────────────────────────────────────────╮${NC}"
+  printf "${CYAN}│${NC}                           ${BOLD}TOTAL SCORE: ${GREEN}%-6s${NC}                           ${CYAN}│${NC}\n" "${SCORE_TOTAL}"
+  echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────────────╯${NC}"
   echo
   
   # File paths
   echo -e "${DIM}📁 JSON saved:${NC} $RESULT_JSON"
-  echo -e "${DIM}🌐 Result URL:${NC} ${YELLOW}(upload not yet implemented)${NC}"
+  echo -e "${DIM}🌐 Result URL:${NC} ${YELLOW}(coming soon - proxmark.io)${NC}"
   echo
 }
 
