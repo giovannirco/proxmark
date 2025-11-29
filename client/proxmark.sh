@@ -644,6 +644,30 @@ check_dependencies() {
 
 # === System Information ===
 
+# Measure power consumption over a duration
+# Usage: measure_power [duration_seconds]
+# Returns: average power in watts
+measure_power() {
+  local duration=${1:-1}
+  
+  if [[ -z "$RAPL_ENERGY_FILE" ]] || [[ ! -f "$RAPL_ENERGY_FILE" ]]; then
+    echo "0"
+    return
+  fi
+  
+  local e1=$(cat "$RAPL_ENERGY_FILE" 2>/dev/null || echo 0)
+  sleep "$duration"
+  local e2=$(cat "$RAPL_ENERGY_FILE" 2>/dev/null || echo 0)
+  
+  if [[ $e2 -gt $e1 ]]; then
+    # Power = energy / time, energy is in microjoules
+    local energy_diff=$((e2 - e1))
+    awk "BEGIN {printf \"%.1f\", $energy_diff / ($duration * 1000000)}"
+  else
+    echo "0"
+  fi
+}
+
 collect_sysinfo() {
   log "Collecting system information..."
   
@@ -706,7 +730,8 @@ collect_sysinfo() {
   CPU_FREQ_MAX_MHZ=""
   CPU_FREQ_CURRENT_MHZ=""
   CPU_TDP_WATTS=""
-  POWER_DRAW_WATTS=""
+  POWER_IDLE_WATTS=""
+  POWER_LOAD_WATTS=""
   
   # Try to get base frequency from cpufreq
   if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/base_frequency ]]; then
@@ -774,29 +799,22 @@ collect_sysinfo() {
     fi
   fi
   
-  # Current power draw from RAPL energy counter
-  # We can sample energy_uj twice with a delay and calculate power
-  local energy_file=""
+  # Detect RAPL energy file for power measurement
+  RAPL_ENERGY_FILE=""
   if [[ -f /sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj ]]; then
-    energy_file="/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj"
+    RAPL_ENERGY_FILE="/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj"
   elif [[ -f /sys/class/powercap/intel-rapl:0/energy_uj ]]; then
-    energy_file="/sys/class/powercap/intel-rapl:0/energy_uj"
+    RAPL_ENERGY_FILE="/sys/class/powercap/intel-rapl:0/energy_uj"
   fi
   
-  if [[ -n "$energy_file" && -f "$energy_file" ]]; then
-    local e1=$(cat "$energy_file" 2>/dev/null || echo 0)
-    sleep 0.5
-    local e2=$(cat "$energy_file" 2>/dev/null || echo 0)
-    if [[ $e2 -gt $e1 ]]; then
-      # Power = energy / time, energy is in microjoules, time is 0.5s
-      local energy_diff=$((e2 - e1))
-      POWER_DRAW_WATTS=$(awk "BEGIN {printf \"%.1f\", $energy_diff / 500000}")
-    fi
+  # Measure idle power
+  if [[ -n "$RAPL_ENERGY_FILE" ]]; then
+    POWER_IDLE_WATTS=$(measure_power 1)
+    log_verbose "Idle power: ${POWER_IDLE_WATTS}W"
   fi
   
   log_verbose "CPU: vendor=$CPU_VENDOR, socket=$CPU_SOCKET, arch=$CPU_ARCH, base=${CPU_FREQ_BASE_MHZ}MHz, max=${CPU_FREQ_MAX_MHZ}MHz, tdp=${CPU_TDP_WATTS}W"
   log_verbose "CPU cache: L1=$CPU_CACHE_L1, L2=$CPU_CACHE_L2, L3=$CPU_CACHE_L3"
-  log_verbose "Power: current=${POWER_DRAW_WATTS}W"
   
   # Memory info
   MEM_TOTAL_KB="$(grep MemTotal /proc/meminfo | awk '{print $2}')"
@@ -1128,7 +1146,8 @@ collect_sysinfo() {
     --arg cpu_freq_base_mhz "${CPU_FREQ_BASE_MHZ:-}" \
     --arg cpu_freq_max_mhz "${CPU_FREQ_MAX_MHZ:-}" \
     --arg cpu_tdp_watts "${CPU_TDP_WATTS:-}" \
-    --arg power_draw_watts "${POWER_DRAW_WATTS:-}" \
+    --arg power_idle_watts "${POWER_IDLE_WATTS:-}" \
+    --arg power_load_watts "${POWER_LOAD_WATTS:-}" \
     --arg cpu_cache_l1 "${CPU_CACHE_L1:-}" \
     --arg cpu_cache_l2 "${CPU_CACHE_L2:-}" \
     --arg cpu_cache_l3 "${CPU_CACHE_L3:-}" \
@@ -1178,7 +1197,8 @@ collect_sysinfo() {
         }
       },
       power: {
-        current_watts: $power_draw_watts
+        idle_watts: $power_idle_watts,
+        load_watts: $power_load_watts
       },
       memory: {
         total_mb: $mem_mb,
@@ -1224,7 +1244,42 @@ run_cpu_benchmark() {
   local threads="$CPU_CORES"
   local out
   
+  # Start power measurement in background during CPU benchmark
+  local power_samples=()
+  local power_pid=""
+  if [[ -n "$RAPL_ENERGY_FILE" && -f "$RAPL_ENERGY_FILE" ]]; then
+    # Sample power every 5 seconds during the test
+    (
+      local sample_interval=5
+      local e_prev=$(cat "$RAPL_ENERGY_FILE" 2>/dev/null || echo 0)
+      sleep $sample_interval
+      while true; do
+        local e_now=$(cat "$RAPL_ENERGY_FILE" 2>/dev/null || echo 0)
+        if [[ $e_now -gt $e_prev ]]; then
+          local diff=$((e_now - e_prev))
+          local power=$(awk "BEGIN {printf \"%.1f\", $diff / ($sample_interval * 1000000)}")
+          echo "$power" >> /tmp/proxmark-power-samples.txt
+        fi
+        e_prev=$e_now
+        sleep $sample_interval
+      done
+    ) &
+    power_pid=$!
+  fi
+  
   out="$(sysbench cpu --cpu-max-prime=20000 --threads="$threads" --time="$CPU_TIME" run 2>&1)"
+  
+  # Stop power measurement and calculate average
+  if [[ -n "$power_pid" ]]; then
+    kill "$power_pid" 2>/dev/null || true
+    wait "$power_pid" 2>/dev/null || true
+    
+    if [[ -f /tmp/proxmark-power-samples.txt ]]; then
+      POWER_LOAD_WATTS=$(awk '{ sum += $1; count++ } END { if (count > 0) printf "%.1f", sum/count; else print "0" }' /tmp/proxmark-power-samples.txt)
+      rm -f /tmp/proxmark-power-samples.txt
+      log_verbose "CPU load power: ${POWER_LOAD_WATTS}W (avg over test)"
+    fi
+  fi
   
   CPU_MULTI_EPS="$(echo "$out" | awk '/events per second/ {print $4}' || echo "0")"
   CPU_MULTI_TOTAL_TIME="$(echo "$out" | awk '/total time:/ {gsub(/s/,""); print $3}' || echo "0")"
@@ -1844,13 +1899,21 @@ print_summary() {
     echo -e "  ${BOLD}Max Freq:${NC}     ${CPU_FREQ_MAX_MHZ} MHz"
   fi
   
-  # TDP and power
-  if [[ -n "$CPU_TDP_WATTS" && "$CPU_TDP_WATTS" != "0" ]]; then
-    local power_info="TDP: ${CPU_TDP_WATTS}W"
-    [[ -n "$POWER_DRAW_WATTS" && "$POWER_DRAW_WATTS" != "0" ]] && power_info+=" (current: ${POWER_DRAW_WATTS}W)"
+  # Power information
+  if [[ -n "$POWER_IDLE_WATTS" && "$POWER_IDLE_WATTS" != "0" ]] || [[ -n "$POWER_LOAD_WATTS" && "$POWER_LOAD_WATTS" != "0" ]]; then
+    local power_info=""
+    if [[ -n "$CPU_TDP_WATTS" && "$CPU_TDP_WATTS" != "0" ]]; then
+      power_info="TDP: ${CPU_TDP_WATTS}W"
+    fi
+    if [[ -n "$POWER_IDLE_WATTS" && "$POWER_IDLE_WATTS" != "0" ]]; then
+      [[ -n "$power_info" ]] && power_info+=", "
+      power_info+="Idle: ${POWER_IDLE_WATTS}W"
+    fi
+    if [[ -n "$POWER_LOAD_WATTS" && "$POWER_LOAD_WATTS" != "0" ]]; then
+      [[ -n "$power_info" ]] && power_info+=", "
+      power_info+="Load: ${POWER_LOAD_WATTS}W"
+    fi
     echo -e "  ${BOLD}Power:${NC}        $power_info"
-  elif [[ -n "$POWER_DRAW_WATTS" && "$POWER_DRAW_WATTS" != "0" ]]; then
-    echo -e "  ${BOLD}Power Draw:${NC}   ${POWER_DRAW_WATTS}W"
   fi
   
   # Cache info
