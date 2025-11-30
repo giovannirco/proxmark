@@ -13,7 +13,7 @@
 set -euo pipefail
 
 # === Version ===
-VERSION="1.0.4"
+VERSION="1.0.9"
 
 # === Colors ===
 RED='\033[0;31m'
@@ -46,15 +46,19 @@ QUIET=false
 JSON_ONLY=false
 NO_INSTALL=false
 ALL_DISKS=false
+INTERACTIVE=true
 HELP=false
 SHOW_VERSION=false
 TAGS=""
 NOTES=""
 CUSTOM_OUTPUT=""
+IPERF_SERVER=""
 
 # === Derived variables ===
 TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
 RESULT_JSON="${RESULT_DIR}/proxmark-result-${TIMESTAMP}.json"
+LOG_FILE="${RESULT_DIR}/proxmark-${TIMESTAMP}.log"
+DEBUG_FILE="${RESULT_DIR}/proxmark-${TIMESTAMP}.debug"
 RUN_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "unknown-$(date +%s)")
 
 # === Helper Functions ===
@@ -104,10 +108,12 @@ ${BOLD}OPTIONS:${NC}
 
 ${BOLD}CONFIGURATION:${NC}
     --disk-path PATH    Directory to use for disk benchmarks (default: /var/lib/vz on Proxmox)
-    --all-disks         Benchmark all detected storage paths (coming soon)
+    --all-disks         Benchmark all detected storage paths
+    --iperf HOST[:PORT] Run network benchmark against iperf3 server (default port: 5201)
     --output FILE       Custom output path for JSON results
     --tag TAG           Add a tag to results (can be used multiple times)
     --notes "TEXT"      Add notes to the benchmark result
+    --non-interactive   Don't prompt for additional disks
 
 ${BOLD}ENVIRONMENT VARIABLES:${NC}
     PROXMARK_DISK_PATH   Same as --disk-path
@@ -123,14 +129,17 @@ ${BOLD}EXAMPLES:${NC}
     # Quick benchmark (~2 min)
     bash proxmark.sh --quick
 
-    # Benchmark specific path
-    bash proxmark.sh --disk-path /mnt/nvme-storage
+    # Benchmark all storage locations
+    bash proxmark.sh --all-disks
+
+    # Include network benchmark (requires iperf3 server)
+    bash proxmark.sh --iperf 192.168.1.100
 
     # Tag your Proxmox node
     bash proxmark.sh --tag "production" --tag "nvme" --notes "New node"
 
-    # JSON output only
-    bash proxmark.sh --json --no-upload
+    # Non-interactive mode (for scripts)
+    curl -sL .../proxmark.sh | bash -s -- --non-interactive
 
     # Debug mode for troubleshooting
     bash proxmark.sh --debug
@@ -142,7 +151,25 @@ ${BOLD}MORE INFO:${NC}
 EOF
 }
 
+write_log() {
+  local level="$1"
+  shift
+  local msg="$*"
+  local ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  
+  # Always write to log file if it exists
+  if [[ -n "${LOG_FILE:-}" ]]; then
+    echo "[$ts] [$level] $msg" >> "$LOG_FILE" 2>/dev/null || true
+  fi
+  
+  # Write to debug file if in debug mode
+  if [[ "$DEBUG" == "true" ]] && [[ -n "${DEBUG_FILE:-}" ]]; then
+    echo "[$ts] [$level] $msg" >> "$DEBUG_FILE" 2>/dev/null || true
+  fi
+}
+
 log() {
+  write_log "INFO" "$*"
   if [[ "$QUIET" == "true" ]] || [[ "$JSON_ONLY" == "true" ]]; then
     return
   fi
@@ -150,6 +177,7 @@ log() {
 }
 
 log_success() {
+  write_log "OK" "$*"
   if [[ "$QUIET" == "true" ]] || [[ "$JSON_ONLY" == "true" ]]; then
     return
   fi
@@ -157,6 +185,7 @@ log_success() {
 }
 
 log_warning() {
+  write_log "WARN" "$*"
   if [[ "$JSON_ONLY" == "true" ]]; then
     return
   fi
@@ -164,10 +193,12 @@ log_warning() {
 }
 
 log_error() {
+  write_log "ERROR" "$*"
   echo -e "${RED}[ERROR]${NC} $*" >&2
 }
 
 log_verbose() {
+  write_log "DEBUG" "$*"
   if [[ "$VERBOSE" == "true" ]] || [[ "$DEBUG" == "true" ]]; then
     echo -e "${DIM}[verbose]${NC} $*" >&2
   fi
@@ -314,7 +345,6 @@ parse_args() {
         ;;
       --all-disks)
         ALL_DISKS=true
-        log_warning "--all-disks feature coming soon, benchmarking default path"
         shift
         ;;
       --output)
@@ -333,6 +363,14 @@ parse_args() {
         NOTES="$2"
         shift 2
         ;;
+      --iperf)
+        IPERF_SERVER="$2"
+        shift 2
+        ;;
+      --non-interactive)
+        INTERACTIVE=false
+        shift
+        ;;
       *)
         log_error "Unknown option: $1"
         usage
@@ -340,6 +378,11 @@ parse_args() {
         ;;
     esac
   done
+  
+  # When running via pipe, disable interactive mode
+  if [[ ! -t 0 ]]; then
+    INTERACTIVE=false
+  fi
   
   # Apply custom output path if specified
   if [[ -n "$CUSTOM_OUTPUT" ]]; then
@@ -477,6 +520,108 @@ check_proxmox() {
   fi
 }
 
+discover_storage_paths() {
+  # Discover all available storage paths for benchmarking
+  DISCOVERED_STORAGE=()
+  
+  # Add current disk path first
+  DISCOVERED_STORAGE+=("$DISK_PATH")
+  
+  # Proxmox storage pools
+  if command -v pvesm >/dev/null 2>&1; then
+    while IFS= read -r line; do
+      local name=$(echo "$line" | awk '{print $1}')
+      local type=$(echo "$line" | awk '{print $2}')
+      local status=$(echo "$line" | awk '{print $3}')
+      
+      [[ "$status" != "active" ]] && continue
+      
+      # Get path for this storage
+      local path=""
+      case "$type" in
+        dir|nfs|cifs|glusterfs)
+          path=$(pvesm path "$name" 2>/dev/null | head -1 | sed 's|/images$||' || echo "")
+          ;;
+        lvmthin|lvm)
+          # LVM storage - check if there's a path we can use
+          path="/var/lib/vz"  # Default for LVM-backed storage
+          ;;
+        zfspool)
+          # ZFS pool - find mount point
+          local dataset=$(pvesm status 2>/dev/null | awk -v n="$name" '$1==n {print $1}')
+          path=$(zfs get -H -o value mountpoint "$dataset" 2>/dev/null || echo "")
+          ;;
+      esac
+      
+      # Add if valid and not already in list
+      if [[ -n "$path" ]] && [[ -d "$path" ]] && [[ ! " ${DISCOVERED_STORAGE[*]} " =~ " $path " ]]; then
+        DISCOVERED_STORAGE+=("$path")
+      fi
+    done < <(pvesm status 2>/dev/null | tail -n +2)
+  fi
+  
+  # Also check common mount points
+  for path in /mnt/pve/* /mnt/*; do
+    if [[ -d "$path" ]] && [[ ! " ${DISCOVERED_STORAGE[*]} " =~ " $path " ]]; then
+      # Check it's not tmpfs and has reasonable space
+      local fs=$(df "$path" 2>/dev/null | awk 'NR==2 {print $1}')
+      local avail=$(df "$path" 2>/dev/null | awk 'NR==2 {print $4}')
+      if [[ "$fs" != "tmpfs" ]] && [[ "${avail:-0}" -gt 2097152 ]]; then  # > 2GB
+        DISCOVERED_STORAGE+=("$path")
+      fi
+    fi
+  done
+  
+  log_verbose "Discovered storage paths: ${DISCOVERED_STORAGE[*]}"
+}
+
+prompt_additional_disks() {
+  # Initialize the array (even if we skip)
+  ADDITIONAL_DISK_PATHS=()
+  
+  # If non-interactive or only one storage, skip
+  if [[ "$INTERACTIVE" != "true" ]] || [[ ${#DISCOVERED_STORAGE[@]} -le 1 ]]; then
+    return
+  fi
+  
+  echo
+  echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "${BOLD}Additional storage paths detected:${NC}"
+  for i in "${!DISCOVERED_STORAGE[@]}"; do
+    if [[ $i -eq 0 ]]; then
+      echo -e "  ${GREEN}[0]${NC} ${DISCOVERED_STORAGE[$i]} (already tested)"
+    else
+      echo -e "  ${CYAN}[$i]${NC} ${DISCOVERED_STORAGE[$i]}"
+    fi
+  done
+  echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo
+  
+  read -p "Test additional storage? (enter numbers separated by space, or 'all', or press Enter to skip): " -t 30 response || response=""
+  
+  if [[ -z "$response" ]]; then
+    return
+  fi
+  
+  ADDITIONAL_DISK_PATHS=()
+  
+  if [[ "$response" == "all" ]]; then
+    for i in "${!DISCOVERED_STORAGE[@]}"; do
+      [[ $i -gt 0 ]] && ADDITIONAL_DISK_PATHS+=("${DISCOVERED_STORAGE[$i]}")
+    done
+  else
+    for num in $response; do
+      if [[ "$num" =~ ^[0-9]+$ ]] && [[ $num -gt 0 ]] && [[ $num -lt ${#DISCOVERED_STORAGE[@]} ]]; then
+        ADDITIONAL_DISK_PATHS+=("${DISCOVERED_STORAGE[$num]}")
+      fi
+    done
+  fi
+  
+  if [[ ${#ADDITIONAL_DISK_PATHS[@]} -gt 0 ]]; then
+    log "Will also benchmark: ${ADDITIONAL_DISK_PATHS[*]}"
+  fi
+}
+
 check_dependencies() {
   log "Checking dependencies..."
   
@@ -486,6 +631,7 @@ check_dependencies() {
   require_cmd_or_install sysbench sysbench
   require_cmd_or_install fio fio
   require_cmd_or_install jq jq
+  require_cmd_or_install lshw lshw
   
   # Check for libaio (needed for fio with libaio engine)
   if [[ "$PKG_MANAGER" == "apt" ]] && ! dpkg -l 2>/dev/null | grep -q libaio; then
@@ -498,55 +644,416 @@ check_dependencies() {
 
 # === System Information ===
 
+# Measure power consumption over a duration
+# Usage: measure_power [duration_seconds]
+# Returns: average power in watts
+measure_power() {
+  local duration=${1:-1}
+  
+  if [[ -z "$RAPL_ENERGY_FILE" ]] || [[ ! -f "$RAPL_ENERGY_FILE" ]]; then
+    echo "0"
+    return
+  fi
+  
+  local e1=$(cat "$RAPL_ENERGY_FILE" 2>/dev/null || echo 0)
+  sleep "$duration"
+  local e2=$(cat "$RAPL_ENERGY_FILE" 2>/dev/null || echo 0)
+  
+  if [[ $e2 -gt $e1 ]]; then
+    # Power = energy / time, energy is in microjoules
+    local energy_diff=$((e2 - e1))
+    awk "BEGIN {printf \"%.1f\", $energy_diff / ($duration * 1000000)}"
+  else
+    echo "0"
+  fi
+}
+
 collect_sysinfo() {
   log "Collecting system information..."
   
   HOSTNAME="$(hostname)"
   
-  # CPU info
+  # CPU info from /proc/cpuinfo (basic)
   CPU_MODEL="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//' || echo 'Unknown')"
-  CPU_CORES="$(nproc --all)"
-  CPU_THREADS="$(grep -c ^processor /proc/cpuinfo 2>/dev/null || echo "$CPU_CORES")"
+  
+  # Get physical cores (not threads)
+  # "cpu cores" in /proc/cpuinfo shows cores per socket
+  local cores_per_socket=$(grep -m1 "cpu cores" /proc/cpuinfo | cut -d: -f2 | tr -d ' ' || echo "")
   CPU_SOCKETS="$(grep 'physical id' /proc/cpuinfo | sort -u | wc -l)"
   [[ "$CPU_SOCKETS" -eq 0 ]] && CPU_SOCKETS=1
+  
+  if [[ -n "$cores_per_socket" && "$cores_per_socket" -gt 0 ]]; then
+    CPU_CORES=$((cores_per_socket * CPU_SOCKETS))
+  else
+    # Fallback: try lscpu
+    CPU_CORES=$(lscpu 2>/dev/null | grep "^Core(s) per socket:" | awk '{print $NF}')
+    [[ -n "$CPU_CORES" ]] && CPU_CORES=$((CPU_CORES * CPU_SOCKETS))
+  fi
+  
+  # Total logical processors (threads)
+  CPU_THREADS="$(nproc --all 2>/dev/null || grep -c ^processor /proc/cpuinfo)"
+  
+  # Fallback if cores detection failed
+  [[ -z "$CPU_CORES" || "$CPU_CORES" -eq 0 ]] && CPU_CORES="$CPU_THREADS"
+  
+  # Additional CPU info
+  CPU_VENDOR=""
+  CPU_SOCKET=""
+  CPU_ARCH=""
+  CPU_CACHE_L1=""
+  CPU_CACHE_L2=""
+  CPU_CACHE_L3=""
+  
+  # Use lshw for detailed CPU info
+  if command -v lshw >/dev/null 2>&1; then
+    local lshw_cpu
+    lshw_cpu=$(run_as_root lshw -C cpu 2>/dev/null || echo "")
+    local lshw_cache
+    lshw_cache=$(run_as_root lshw -C memory 2>/dev/null | grep -A5 "cache" || echo "")
+    
+    if [[ -n "$lshw_cpu" ]]; then
+      # Extract vendor
+      CPU_VENDOR=$(echo "$lshw_cpu" | grep "vendor:" | head -1 | sed 's/.*vendor: //' | sed 's/\[.*\]//' | xargs)
+      
+      # Extract socket type (slot)
+      CPU_SOCKET=$(echo "$lshw_cpu" | grep "slot:" | head -1 | sed 's/.*slot: //')
+      
+      # Extract architecture (width)
+      local width=$(echo "$lshw_cpu" | grep "width:" | head -1 | sed 's/.*width: //')
+      [[ -n "$width" ]] && CPU_ARCH="$width"
+    fi
+    
+    # Extract cache info from lshw memory output
+    if [[ -n "$lshw_cache" ]]; then
+      CPU_CACHE_L1=$(run_as_root lshw -C memory 2>/dev/null | grep -A3 "L1" | grep "size:" | head -1 | sed 's/.*size: //')
+      CPU_CACHE_L2=$(run_as_root lshw -C memory 2>/dev/null | grep -A3 "L2" | grep "size:" | head -1 | sed 's/.*size: //')
+      CPU_CACHE_L3=$(run_as_root lshw -C memory 2>/dev/null | grep -A3 "L3" | grep "size:" | head -1 | sed 's/.*size: //')
+    fi
+  fi
+  
+  # Fallback vendor detection from /proc/cpuinfo
+  if [[ -z "$CPU_VENDOR" ]]; then
+    local vendor_id=$(grep -m1 'vendor_id' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')
+    case "$vendor_id" in
+      GenuineIntel) CPU_VENDOR="Intel" ;;
+      AuthenticAMD) CPU_VENDOR="AMD" ;;
+      *) CPU_VENDOR="$vendor_id" ;;
+    esac
+  fi
   
   # CPU frequency detection (base and max/boost)
   CPU_FREQ_BASE_MHZ=""
   CPU_FREQ_MAX_MHZ=""
+  CPU_FREQ_CURRENT_MHZ=""
+  CPU_TDP_WATTS=""
+  POWER_IDLE_WATTS=""
+  POWER_LOAD_WATTS=""
   
   # Try to get base frequency from cpufreq
   if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/base_frequency ]]; then
     local base_khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/base_frequency 2>/dev/null || echo 0)
     CPU_FREQ_BASE_MHZ=$((base_khz / 1000))
-  elif [[ -f /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq ]]; then
-    # Fallback: use min freq as approximation (not always accurate)
-    local min_khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq 2>/dev/null || echo 0)
-    # Only use if it's reasonable (> 800 MHz)
-    if [[ $min_khz -gt 800000 ]]; then
-      CPU_FREQ_BASE_MHZ=$((min_khz / 1000))
+  fi
+  
+  # Try lshw for base frequency (shown as "size" = current, "capacity" = max)
+  if [[ -z "$CPU_FREQ_BASE_MHZ" || "$CPU_FREQ_BASE_MHZ" == "0" ]] && command -v lshw >/dev/null 2>&1; then
+    local lshw_cpu=$(run_as_root lshw -C cpu 2>/dev/null || echo "")
+    if [[ -n "$lshw_cpu" ]]; then
+      # lshw shows frequencies like "size: 2397MHz" or "capacity: 4GHz" or "capacity: 4367MHz"
+      # Need to handle both MHz and GHz units
+      local lshw_size_raw=$(echo "$lshw_cpu" | grep "size:" | head -1 | sed 's/.*size: //' | grep -oE '[0-9.]+[GM]Hz')
+      local lshw_capacity_raw=$(echo "$lshw_cpu" | grep "capacity:" | head -1 | sed 's/.*capacity: //' | grep -oE '[0-9.]+[GM]Hz')
+      
+      # Helper to convert to MHz
+      convert_to_mhz() {
+        local val="$1"
+        local num=$(echo "$val" | grep -oE '[0-9.]+')
+        if echo "$val" | grep -q "GHz"; then
+          awk "BEGIN {printf \"%.0f\", $num * 1000}"
+        else
+          printf "%.0f" "$num"
+        fi
+      }
+      
+      # Current frequency
+      if [[ -n "$lshw_size_raw" ]]; then
+        CPU_FREQ_CURRENT_MHZ=$(convert_to_mhz "$lshw_size_raw")
+      fi
+      # Max frequency from capacity
+      if [[ -n "$lshw_capacity_raw" ]]; then
+        local max_mhz=$(convert_to_mhz "$lshw_capacity_raw")
+        # Sanity check: must be > 100 MHz
+        [[ "$max_mhz" -gt 100 ]] && CPU_FREQ_MAX_MHZ="$max_mhz"
+      fi
     fi
   fi
   
-  # Get max/boost frequency
-  if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq ]]; then
-    local max_khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null || echo 0)
-    CPU_FREQ_MAX_MHZ=$((max_khz / 1000))
-  elif grep -q "cpu MHz" /proc/cpuinfo; then
-    CPU_FREQ_MAX_MHZ=$(grep -m1 "cpu MHz" /proc/cpuinfo | awk '{printf "%.0f", $4}')
+  # Fallback: use min freq as base approximation
+  if [[ -z "$CPU_FREQ_BASE_MHZ" || "$CPU_FREQ_BASE_MHZ" == "0" ]]; then
+    if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq ]]; then
+      local min_khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq 2>/dev/null || echo 0)
+      # Only use if it's reasonable (> 800 MHz)
+      if [[ $min_khz -gt 800000 ]]; then
+        CPU_FREQ_BASE_MHZ=$((min_khz / 1000))
+      fi
+    fi
   fi
+  
+  # Try to extract base frequency from CPU model name (e.g., "@ 3.50GHz")
+  if [[ -z "$CPU_FREQ_BASE_MHZ" || "$CPU_FREQ_BASE_MHZ" == "0" ]]; then
+    local model_freq=$(echo "$CPU_MODEL" | grep -oE '@[[:space:]]*[0-9]+\.[0-9]+GHz' | grep -oE '[0-9]+\.[0-9]+')
+    if [[ -n "$model_freq" ]]; then
+      CPU_FREQ_BASE_MHZ=$(awk "BEGIN {printf \"%.0f\", $model_freq * 1000}")
+    fi
+  fi
+  
+  # Try lscpu for base frequency (works on some systems)
+  if [[ -z "$CPU_FREQ_BASE_MHZ" || "$CPU_FREQ_BASE_MHZ" == "0" ]]; then
+    # lscpu shows "CPU base MHz" on some systems
+    local lscpu_base=$(lscpu 2>/dev/null | grep -i "CPU base MHz" | awk -F: '{print $2}' | tr -d ' ' | cut -d. -f1)
+    if [[ -n "$lscpu_base" && "$lscpu_base" -gt 0 ]]; then
+      CPU_FREQ_BASE_MHZ="$lscpu_base"
+    fi
+  fi
+  
+  # For AMD: try reading from /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_frequencies
+  # and pick a sensible base (often the second-highest value)
+  if [[ -z "$CPU_FREQ_BASE_MHZ" || "$CPU_FREQ_BASE_MHZ" == "0" ]]; then
+    if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_frequencies ]]; then
+      # Get all frequencies, sort descending, pick second one as "base"
+      local freqs=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_frequencies 2>/dev/null | tr ' ' '\n' | sort -rn | head -5)
+      # Skip the boost frequency, use the second highest as base approximation
+      local base_khz=$(echo "$freqs" | sed -n '2p')
+      if [[ -n "$base_khz" && "$base_khz" -gt 1000000 ]]; then
+        CPU_FREQ_BASE_MHZ=$((base_khz / 1000))
+      fi
+    fi
+  fi
+  
+  # Try cpupower if available (common on Proxmox)
+  if [[ -z "$CPU_FREQ_BASE_MHZ" || "$CPU_FREQ_BASE_MHZ" == "0" ]]; then
+    if command -v cpupower >/dev/null 2>&1; then
+      local cpupower_out=$(cpupower frequency-info 2>/dev/null)
+      # Look for "hardware limits" which shows min - max
+      local hw_limits=$(echo "$cpupower_out" | grep "hardware limits" | grep -oE '[0-9.]+ [GM]Hz' | head -2)
+      if [[ -n "$hw_limits" ]]; then
+        # First value is min, we want something in between or documented base
+        local min_freq=$(echo "$hw_limits" | head -1)
+        # Extract number and unit
+        local min_val=$(echo "$min_freq" | grep -oE '[0-9.]+')
+        local min_unit=$(echo "$min_freq" | grep -oE '[GM]Hz')
+        # This is actually the hardware minimum, not base - skip it
+      fi
+    fi
+  fi
+  
+  # Last resort for AMD: check if boost is disabled and use max as base
+  if [[ -z "$CPU_FREQ_BASE_MHZ" || "$CPU_FREQ_BASE_MHZ" == "0" ]]; then
+    if [[ -f /sys/devices/system/cpu/cpufreq/boost ]]; then
+      local boost_enabled=$(cat /sys/devices/system/cpu/cpufreq/boost 2>/dev/null)
+      if [[ "$boost_enabled" == "0" ]]; then
+        # Boost disabled, max freq IS the base
+        CPU_FREQ_BASE_MHZ="$CPU_FREQ_MAX_MHZ"
+      fi
+    fi
+  fi
+  
+  
+  # Get max/boost frequency if not already set
+  if [[ -z "$CPU_FREQ_MAX_MHZ" || "$CPU_FREQ_MAX_MHZ" == "0" ]]; then
+    if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq ]]; then
+      local max_khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null || echo 0)
+      CPU_FREQ_MAX_MHZ=$((max_khz / 1000))
+    elif grep -q "cpu MHz" /proc/cpuinfo; then
+      CPU_FREQ_MAX_MHZ=$(grep -m1 "cpu MHz" /proc/cpuinfo | awk '{printf "%.0f", $4}')
+    fi
+  fi
+  
+  # CPU TDP from RAPL (Running Average Power Limit)
+  # Intel: /sys/class/powercap/intel-rapl/intel-rapl:0/constraint_0_max_power_uw
+  # AMD: Similar path or via /sys/devices/system/cpu/cpufreq/*/energy_performance_preference
+  if [[ -f /sys/class/powercap/intel-rapl/intel-rapl:0/constraint_0_max_power_uw ]]; then
+    local tdp_uw=$(cat /sys/class/powercap/intel-rapl/intel-rapl:0/constraint_0_max_power_uw 2>/dev/null || echo 0)
+    if [[ $tdp_uw -gt 0 ]]; then
+      CPU_TDP_WATTS=$((tdp_uw / 1000000))
+    fi
+  elif [[ -f /sys/class/powercap/intel-rapl:0/constraint_0_max_power_uw ]]; then
+    local tdp_uw=$(cat /sys/class/powercap/intel-rapl:0/constraint_0_max_power_uw 2>/dev/null || echo 0)
+    if [[ $tdp_uw -gt 0 ]]; then
+      CPU_TDP_WATTS=$((tdp_uw / 1000000))
+    fi
+  fi
+  
+  # Detect RAPL energy file for power measurement
+  RAPL_ENERGY_FILE=""
+  if [[ -f /sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj ]]; then
+    RAPL_ENERGY_FILE="/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj"
+  elif [[ -f /sys/class/powercap/intel-rapl:0/energy_uj ]]; then
+    RAPL_ENERGY_FILE="/sys/class/powercap/intel-rapl:0/energy_uj"
+  fi
+  
+  # Measure idle power
+  if [[ -n "$RAPL_ENERGY_FILE" ]]; then
+    POWER_IDLE_WATTS=$(measure_power 1)
+    log_verbose "Idle power: ${POWER_IDLE_WATTS}W"
+  fi
+  
+  log_verbose "CPU: vendor=$CPU_VENDOR, socket=$CPU_SOCKET, arch=$CPU_ARCH, base=${CPU_FREQ_BASE_MHZ}MHz, max=${CPU_FREQ_MAX_MHZ}MHz, tdp=${CPU_TDP_WATTS}W"
+  log_verbose "CPU cache: L1=$CPU_CACHE_L1, L2=$CPU_CACHE_L2, L3=$CPU_CACHE_L3"
   
   # Memory info
   MEM_TOTAL_KB="$(grep MemTotal /proc/meminfo | awk '{print $2}')"
   MEM_TOTAL_MB=$((MEM_TOTAL_KB / 1024))
   MEM_TOTAL_GB=$((MEM_TOTAL_MB / 1024))
   
-  # Try to detect memory type and speed (best effort)
+  # Memory detection using lshw (preferred) or dmidecode fallback
   MEM_TYPE="unknown"
   MEM_SPEED=""
-  if command -v dmidecode >/dev/null 2>&1; then
-    MEM_TYPE=$(run_as_root dmidecode -t memory 2>/dev/null | grep -m1 "Type:" | grep -v "Error" | awk '{print $2}' || echo "unknown")
-    MEM_SPEED=$(run_as_root dmidecode -t memory 2>/dev/null | grep -m1 "Speed:" | grep -v "Unknown" | awk '{print $2, $3}' || echo "")
+  MEM_CHANNELS=""
+  MEM_SLOTS_USED=0
+  MEM_SLOTS_TOTAL=0
+  MEM_ECC=""
+  MEM_FORM_FACTOR=""
+  MEM_BANKS=()  # Array to store per-bank info
+  MEM_BANKS_JSON="[]"
+  
+  if command -v lshw >/dev/null 2>&1; then
+    local lshw_mem
+    lshw_mem=$(run_as_root lshw -C memory 2>/dev/null || echo "")
+    
+    if [[ -n "$lshw_mem" ]]; then
+      # Parse memory banks from lshw output
+      local bank_idx=0
+      local in_bank=false
+      local bank_desc="" bank_product="" bank_vendor="" bank_slot="" bank_size="" bank_clock=""
+      
+      while IFS= read -r line; do
+        # Check for new section (bank, cache, memory, firmware)
+        if echo "$line" | grep -q "^\s*\*-"; then
+          # Save previous bank if exists and was valid
+          if [[ "$in_bank" == true ]] && [[ -n "$bank_size" ]] && [[ "$bank_size" != "[empty]" ]]; then
+            MEM_BANKS+=("$bank_slot|$bank_size|$bank_vendor|$bank_product|$bank_clock")
+            MEM_SLOTS_USED=$((MEM_SLOTS_USED + 1))
+          fi
+          
+          # Check if this is a new bank section
+          if echo "$line" | grep -q "^\s*\*-bank"; then
+            in_bank=true
+            bank_desc="" bank_product="" bank_vendor="" bank_slot="" bank_size="" bank_clock=""
+            MEM_SLOTS_TOTAL=$((MEM_SLOTS_TOTAL + 1))
+          else
+            # Not a bank section (cache, firmware, etc.) - stop parsing as bank
+            in_bank=false
+          fi
+        elif [[ "$in_bank" == true ]]; then
+          if echo "$line" | grep -q "description:"; then
+            bank_desc=$(echo "$line" | sed 's/.*description: //')
+            # Extract form factor and type from description
+            if echo "$bank_desc" | grep -qi "SODIMM"; then
+              MEM_FORM_FACTOR="SODIMM"
+            elif echo "$bank_desc" | grep -qi "DIMM"; then
+              MEM_FORM_FACTOR="DIMM"
+            fi
+            if echo "$bank_desc" | grep -qi "DDR5"; then
+              MEM_TYPE="DDR5"
+            elif echo "$bank_desc" | grep -qi "DDR4"; then
+              MEM_TYPE="DDR4"
+            elif echo "$bank_desc" | grep -qi "DDR3"; then
+              MEM_TYPE="DDR3"
+            fi
+            # Check for ECC/Unbuffered
+            if echo "$bank_desc" | grep -qi "Unbuffered"; then
+              MEM_ECC="Non-ECC"
+            elif echo "$bank_desc" | grep -qi "Registered\|ECC"; then
+              MEM_ECC="ECC"
+            fi
+          elif echo "$line" | grep -q "product:"; then
+            bank_product=$(echo "$line" | sed 's/.*product: //')
+          elif echo "$line" | grep -q "vendor:"; then
+            bank_vendor=$(echo "$line" | sed 's/.*vendor: //')
+          elif echo "$line" | grep -q "slot:"; then
+            bank_slot=$(echo "$line" | sed 's/.*slot: //')
+          elif echo "$line" | grep -q "size:"; then
+            bank_size=$(echo "$line" | sed 's/.*size: //')
+          elif echo "$line" | grep -q "clock:"; then
+            bank_clock=$(echo "$line" | sed 's/.*clock: //' | awk '{print $1}')
+            [[ -z "$MEM_SPEED" ]] && MEM_SPEED="${bank_clock}"
+          fi
+        fi
+      done <<< "$lshw_mem"
+      
+      # Save last bank if we ended while still in a bank section
+      if [[ "$in_bank" == true ]] && [[ -n "$bank_size" ]] && [[ "$bank_size" != "[empty]" ]] && [[ ! "$bank_slot" =~ [Cc]ache ]]; then
+        MEM_BANKS+=("$bank_slot|$bank_size|$bank_vendor|$bank_product|$bank_clock")
+        MEM_SLOTS_USED=$((MEM_SLOTS_USED + 1))
+      fi
+      
+      # Build JSON array for memory banks
+      if [[ ${#MEM_BANKS[@]} -gt 0 ]]; then
+        MEM_BANKS_JSON="["
+        for i in "${!MEM_BANKS[@]}"; do
+          IFS='|' read -r slot size vendor product clock <<< "${MEM_BANKS[$i]}"
+          [[ $i -gt 0 ]] && MEM_BANKS_JSON+=","
+          MEM_BANKS_JSON+="{\"slot\":\"$slot\",\"size\":\"$size\",\"vendor\":\"$vendor\",\"product\":\"$product\",\"speed\":\"$clock\"}"
+        done
+        MEM_BANKS_JSON+="]"
+      fi
+    fi
   fi
+  
+  # Fallback to dmidecode if lshw didn't provide enough info
+  if [[ "$MEM_TYPE" == "unknown" ]] && command -v dmidecode >/dev/null 2>&1; then
+    local dmi_out
+    dmi_out=$(run_as_root dmidecode -t memory 2>/dev/null || echo "")
+    if [[ -n "$dmi_out" ]]; then
+      MEM_TYPE=$(echo "$dmi_out" | grep -E "^\s*Type:" | grep -v "Error" | grep -v "Unknown" | head -1 | awk '{print $2}' || echo "unknown")
+      [[ -z "$MEM_TYPE" ]] && MEM_TYPE="unknown"
+      
+      if [[ -z "$MEM_SPEED" ]]; then
+        MEM_SPEED=$(echo "$dmi_out" | grep -E "^\s*Configured Memory Speed:" | grep -v "Unknown" | head -1 | awk '{print $4}' || echo "")
+        [[ -z "$MEM_SPEED" ]] && MEM_SPEED=$(echo "$dmi_out" | grep -E "^\s*Speed:" | grep -v "Unknown" | head -1 | awk '{print $2}' || echo "")
+      fi
+      
+      if [[ -z "$MEM_ECC" ]]; then
+        local ecc_type=$(echo "$dmi_out" | grep -E "^\s*Error Correction Type:" | head -1 | awk '{print $4}' || echo "")
+        if [[ "$ecc_type" == "Single-bit" ]] || [[ "$ecc_type" == "Multi-bit" ]]; then
+          MEM_ECC="ECC"
+        elif [[ "$ecc_type" == "None" ]]; then
+          MEM_ECC="Non-ECC"
+        fi
+      fi
+      
+      if [[ $MEM_SLOTS_TOTAL -eq 0 ]]; then
+        MEM_SLOTS_TOTAL=$(echo "$dmi_out" | grep -c "Memory Device" || echo 0)
+        MEM_SLOTS_USED=$(echo "$dmi_out" | grep -E "^\s*Size:" | grep -v "No Module" | grep -v "Unknown" | wc -l || echo 0)
+      fi
+    fi
+  fi
+  
+  # Determine channel configuration
+  if [[ $MEM_SLOTS_USED -eq 1 ]]; then
+    MEM_CHANNELS="Single Channel"
+  elif [[ $MEM_SLOTS_USED -eq 2 ]]; then
+    MEM_CHANNELS="Dual Channel"
+  elif [[ $MEM_SLOTS_USED -eq 3 ]]; then
+    MEM_CHANNELS="Triple Channel"
+  elif [[ $MEM_SLOTS_USED -eq 4 ]]; then
+    MEM_CHANNELS="Quad Channel"
+  elif [[ $MEM_SLOTS_USED -eq 6 ]]; then
+    MEM_CHANNELS="Hexa Channel"
+  elif [[ $MEM_SLOTS_USED -eq 8 ]]; then
+    MEM_CHANNELS="Octa Channel"
+  elif [[ $MEM_SLOTS_USED -gt 8 ]]; then
+    MEM_CHANNELS="${MEM_SLOTS_USED}-DIMM"
+  fi
+  
+  # Add MT/s suffix if just a number
+  if [[ -n "$MEM_SPEED" ]] && [[ "$MEM_SPEED" =~ ^[0-9]+$ ]]; then
+    MEM_SPEED="${MEM_SPEED}MHz"
+  fi
+  
+  log_verbose "Memory detection: type=$MEM_TYPE, form=$MEM_FORM_FACTOR, speed=$MEM_SPEED, slots=${MEM_SLOTS_USED}/${MEM_SLOTS_TOTAL}, channels=$MEM_CHANNELS, ecc=$MEM_ECC"
+  log_verbose "Memory banks: ${MEM_BANKS[*]}"
   
   # Kernel and OS
   KERNEL="$(uname -r)"
@@ -560,30 +1067,134 @@ collect_sysinfo() {
   
   # Proxmox detection - use pveversion command (preferred)
   PROXMOX_VERSION=""
+  PVE_NODE_NAME=""
+  PVE_CLUSTER_NAME=""
+  PVE_CLUSTER_NODES=0
+  PVE_SUBSCRIPTION=""
+  PVE_VM_COUNT=0
+  PVE_CT_COUNT=0
+  PVE_STORAGE_INFO=""
+  
   if command -v pveversion >/dev/null 2>&1; then
     PROXMOX_VERSION=$(pveversion 2>/dev/null | head -1 || echo "")
+    
+    # Get node name
+    PVE_NODE_NAME=$(hostname -s 2>/dev/null || hostname)
+    
+    # Cluster info
+    if command -v pvecm >/dev/null 2>&1; then
+      local cluster_status=$(pvecm status 2>/dev/null || echo "")
+      if [[ -n "$cluster_status" ]] && ! echo "$cluster_status" | grep -q "does not exist"; then
+        PVE_CLUSTER_NAME=$(echo "$cluster_status" | grep -m1 "Name:" | awk '{print $2}' || echo "")
+        PVE_CLUSTER_NODES=$(echo "$cluster_status" | grep -m1 "Nodes:" | awk '{print $2}' || echo 0)
+      fi
+    fi
+    
+    # Subscription status
+    if command -v pvesubscription >/dev/null 2>&1; then
+      local sub_status=$(pvesubscription get 2>/dev/null | grep -m1 "status" || echo "")
+      if echo "$sub_status" | grep -qi "active"; then
+        PVE_SUBSCRIPTION="active"
+      elif echo "$sub_status" | grep -qi "notfound"; then
+        PVE_SUBSCRIPTION="none"
+      else
+        PVE_SUBSCRIPTION="unknown"
+      fi
+    fi
+    
+    # Count VMs and containers
+    if command -v qm >/dev/null 2>&1; then
+      PVE_VM_COUNT=$(qm list 2>/dev/null | tail -n +2 | wc -l || echo 0)
+    fi
+    if command -v pct >/dev/null 2>&1; then
+      PVE_CT_COUNT=$(pct list 2>/dev/null | tail -n +2 | wc -l || echo 0)
+    fi
+    
+    # Storage info
+    if command -v pvesm >/dev/null 2>&1; then
+      PVE_STORAGE_INFO=$(pvesm status 2>/dev/null | tail -n +2 | awk '{printf "%s(%s) ", $1, $2}' || echo "")
+    fi
+    
+    log_verbose "Proxmox info: node=$PVE_NODE_NAME, cluster=$PVE_CLUSTER_NAME, nodes=$PVE_CLUSTER_NODES, VMs=$PVE_VM_COUNT, CTs=$PVE_CT_COUNT"
   fi
   
-  # Disk info
+  # Disk info - detect the physical device underlying the mount
   ROOT_DEV="$(df "$DISK_PATH" 2>/dev/null | awk 'NR==2{print $1}')"
   DISK_MODEL=""
   DISK_TYPE="unknown"
   DISK_SIZE_GB=0
+  PHYSICAL_DEV=""
   
-  if [[ "$ROOT_DEV" == /dev/* ]]; then
+  # Resolve the actual physical device
+  if [[ "$ROOT_DEV" == /dev/mapper/* ]]; then
+    # LVM or device-mapper - need to resolve /dev/mapper/name to dm-X first
+    # /dev/mapper/pve-root is a symlink to /dev/dm-X
+    local real_dev=$(readlink -f "$ROOT_DEV" 2>/dev/null)
+    local dm_name=$(basename "$real_dev" 2>/dev/null)
+    log_verbose "Resolving LVM: $ROOT_DEV -> $real_dev ($dm_name)"
+    
+    if [[ "$dm_name" == dm-* ]] && [[ -d "/sys/block/$dm_name/slaves" ]]; then
+      # Get first slave device (the physical volume)
+      local slave=$(ls "/sys/block/$dm_name/slaves" 2>/dev/null | head -1)
+      log_verbose "Found slave device: $slave"
+      if [[ -n "$slave" ]]; then
+        # Recursively check if slave is also a dm device
+        while [[ -d "/sys/block/$slave/slaves" ]] && [[ -n "$(ls /sys/block/$slave/slaves 2>/dev/null)" ]]; do
+          slave=$(ls "/sys/block/$slave/slaves" 2>/dev/null | head -1)
+          log_verbose "Following chain to: $slave"
+        done
+        PHYSICAL_DEV="/dev/$slave"
+      fi
+    fi
+    
+    # Try lsblk as fallback
+    if [[ -z "$PHYSICAL_DEV" || "$PHYSICAL_DEV" == "/dev/" ]] && command -v lsblk >/dev/null 2>&1; then
+      local pkname=$(lsblk -no PKNAME "$ROOT_DEV" 2>/dev/null | grep -v '^$' | tail -1)
+      if [[ -n "$pkname" ]]; then
+        PHYSICAL_DEV="/dev/$pkname"
+        log_verbose "lsblk found parent: $pkname"
+      fi
+    fi
+    
+    # Try dmsetup as another fallback
+    if [[ -z "$PHYSICAL_DEV" || "$PHYSICAL_DEV" == "/dev/" ]] && command -v dmsetup >/dev/null 2>&1; then
+      local deps=$(run_as_root dmsetup deps "$ROOT_DEV" 2>/dev/null | grep -oE '\([0-9]+, [0-9]+\)' | head -1)
+      if [[ -n "$deps" ]]; then
+        local major=$(echo "$deps" | grep -oE '[0-9]+' | head -1)
+        local minor=$(echo "$deps" | grep -oE '[0-9]+' | tail -1)
+        # Find device with this major:minor
+        local dev_path=$(ls -la /dev 2>/dev/null | awk -v maj="$major" -v min="$minor" '$5==maj"," && $6==min {print "/dev/"$10}' | head -1)
+        if [[ -n "$dev_path" ]]; then
+          PHYSICAL_DEV="$dev_path"
+          log_verbose "dmsetup found device: $dev_path (major:$major minor:$minor)"
+        fi
+      fi
+    fi
+    
+    log_verbose "LVM device $ROOT_DEV -> physical device: ${PHYSICAL_DEV:-unknown}"
+  elif [[ "$ROOT_DEV" == /dev/* ]]; then
+    PHYSICAL_DEV="$ROOT_DEV"
+  fi
+  
+  if [[ -n "$PHYSICAL_DEV" ]]; then
     # Strip partition number (handles nvme0n1p1 and sda1 formats)
-    if [[ "$ROOT_DEV" =~ nvme ]]; then
-      BASE_DEV="$(echo "$ROOT_DEV" | sed 's/p[0-9]*$//')"
+    if [[ "$PHYSICAL_DEV" =~ nvme ]]; then
+      BASE_DEV="$(echo "$PHYSICAL_DEV" | sed 's/p[0-9]*$//')"
       DISK_TYPE="nvme"
     else
-      BASE_DEV="$(echo "$ROOT_DEV" | sed 's/[0-9]*$//')"
+      BASE_DEV="$(echo "$PHYSICAL_DEV" | sed 's/[0-9]*$//')"
     fi
     
     DEV_NAME=$(basename "$BASE_DEV")
+    log_verbose "Base device: $BASE_DEV ($DEV_NAME)"
     
     # Get disk model
     if [[ -e "/sys/block/${DEV_NAME}/device/model" ]]; then
-      DISK_MODEL="$(cat "/sys/block/${DEV_NAME}/device/model" 2>/dev/null | tr -d ' \t\n' || echo "")"
+      DISK_MODEL="$(cat "/sys/block/${DEV_NAME}/device/model" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || echo "")"
+    fi
+    # Try nvme id-ctrl for NVMe devices
+    if [[ -z "$DISK_MODEL" ]] && [[ "$DISK_TYPE" == "nvme" ]] && command -v nvme >/dev/null 2>&1; then
+      DISK_MODEL=$(run_as_root nvme id-ctrl "$BASE_DEV" 2>/dev/null | grep -m1 "^mn " | awk '{$1=""; print $0}' | sed 's/^[[:space:]]*//' || echo "")
     fi
     
     # Get disk size
@@ -603,25 +1214,49 @@ collect_sysinfo() {
         fi
       fi
     fi
+    
+    log_verbose "Disk detection: model=$DISK_MODEL, type=$DISK_TYPE, size=${DISK_SIZE_GB}GB"
   fi
   
   # Build JSON
   SYSINFO_JSON=$(jq -n \
     --arg host "$HOSTNAME" \
     --arg cpu_model "$CPU_MODEL" \
+    --arg cpu_vendor "${CPU_VENDOR:-}" \
+    --arg cpu_socket "${CPU_SOCKET:-}" \
+    --arg cpu_arch "${CPU_ARCH:-}" \
     --argjson cpu_cores "$CPU_CORES" \
     --argjson cpu_threads "$CPU_THREADS" \
     --argjson cpu_sockets "$CPU_SOCKETS" \
     --arg cpu_freq_base_mhz "${CPU_FREQ_BASE_MHZ:-}" \
     --arg cpu_freq_max_mhz "${CPU_FREQ_MAX_MHZ:-}" \
+    --arg cpu_tdp_watts "${CPU_TDP_WATTS:-}" \
+    --arg power_idle_watts "${POWER_IDLE_WATTS:-}" \
+    --arg power_load_watts "${POWER_LOAD_WATTS:-}" \
+    --arg cpu_cache_l1 "${CPU_CACHE_L1:-}" \
+    --arg cpu_cache_l2 "${CPU_CACHE_L2:-}" \
+    --arg cpu_cache_l3 "${CPU_CACHE_L3:-}" \
     --argjson mem_mb "$MEM_TOTAL_MB" \
     --arg mem_type "$MEM_TYPE" \
+    --arg mem_form "${MEM_FORM_FACTOR:-}" \
     --arg mem_speed "${MEM_SPEED:-}" \
+    --arg mem_channels "${MEM_CHANNELS:-}" \
+    --argjson mem_slots_used "${MEM_SLOTS_USED:-0}" \
+    --argjson mem_slots_total "${MEM_SLOTS_TOTAL:-0}" \
+    --arg mem_ecc "${MEM_ECC:-}" \
+    --argjson mem_banks "$MEM_BANKS_JSON" \
     --arg kernel "$KERNEL" \
     --arg os "$OS" \
     --arg virt "$VIRT_TYPE" \
     --argjson is_proxmox "$([[ "${IS_PROXMOX:-false}" == "true" ]] && echo "true" || echo "false")" \
     --arg pve_version "$PROXMOX_VERSION" \
+    --arg pve_node "${PVE_NODE_NAME:-}" \
+    --arg pve_cluster "${PVE_CLUSTER_NAME:-}" \
+    --argjson pve_cluster_nodes "${PVE_CLUSTER_NODES:-0}" \
+    --arg pve_subscription "${PVE_SUBSCRIPTION:-}" \
+    --argjson pve_vm_count "${PVE_VM_COUNT:-0}" \
+    --argjson pve_ct_count "${PVE_CT_COUNT:-0}" \
+    --arg pve_storage "${PVE_STORAGE_INFO:-}" \
     --arg root_dev "$ROOT_DEV" \
     --arg disk_model "$DISK_MODEL" \
     --arg disk_type "$DISK_TYPE" \
@@ -629,20 +1264,52 @@ collect_sysinfo() {
     --arg disk_path "$DISK_PATH" \
     '{
       hostname: $host,
-      cpu_model: $cpu_model,
-      cpu_cores: $cpu_cores,
-      cpu_threads: $cpu_threads,
-      cpu_sockets: $cpu_sockets,
-      cpu_freq_base_mhz: $cpu_freq_base_mhz,
-      cpu_freq_max_mhz: $cpu_freq_max_mhz,
-      mem_total_mb: $mem_mb,
-      mem_type: $mem_type,
-      mem_speed: $mem_speed,
+      cpu: {
+        model: $cpu_model,
+        vendor: $cpu_vendor,
+        socket: $cpu_socket,
+        architecture: $cpu_arch,
+        cores: $cpu_cores,
+        threads: $cpu_threads,
+        sockets: $cpu_sockets,
+        freq_base_mhz: $cpu_freq_base_mhz,
+        freq_max_mhz: $cpu_freq_max_mhz,
+        tdp_watts: $cpu_tdp_watts,
+        cache: {
+          l1: $cpu_cache_l1,
+          l2: $cpu_cache_l2,
+          l3: $cpu_cache_l3
+        }
+      },
+      power: {
+        idle_watts: $power_idle_watts,
+        load_watts: $power_load_watts
+      },
+      memory: {
+        total_mb: $mem_mb,
+        type: $mem_type,
+        form_factor: $mem_form,
+        speed: $mem_speed,
+        channels: $mem_channels,
+        slots_used: $mem_slots_used,
+        slots_total: $mem_slots_total,
+        ecc: $mem_ecc,
+        banks: $mem_banks
+      },
       kernel: $kernel,
       os: $os,
       virtualization: $virt,
       is_proxmox: $is_proxmox,
-      proxmox_version: $pve_version,
+      proxmox: {
+        version: $pve_version,
+        node_name: $pve_node,
+        cluster_name: $pve_cluster,
+        cluster_nodes: $pve_cluster_nodes,
+        subscription: $pve_subscription,
+        vm_count: $pve_vm_count,
+        ct_count: $pve_ct_count,
+        storage: $pve_storage
+      },
       root_device: $root_dev,
       disk_model: $disk_model,
       disk_type: $disk_type,
@@ -662,7 +1329,42 @@ run_cpu_benchmark() {
   local threads="$CPU_CORES"
   local out
   
+  # Start power measurement in background during CPU benchmark
+  local power_samples=()
+  local power_pid=""
+  if [[ -n "$RAPL_ENERGY_FILE" && -f "$RAPL_ENERGY_FILE" ]]; then
+    # Sample power every 5 seconds during the test
+    (
+      local sample_interval=5
+      local e_prev=$(cat "$RAPL_ENERGY_FILE" 2>/dev/null || echo 0)
+      sleep $sample_interval
+      while true; do
+        local e_now=$(cat "$RAPL_ENERGY_FILE" 2>/dev/null || echo 0)
+        if [[ $e_now -gt $e_prev ]]; then
+          local diff=$((e_now - e_prev))
+          local power=$(awk "BEGIN {printf \"%.1f\", $diff / ($sample_interval * 1000000)}")
+          echo "$power" >> /tmp/proxmark-power-samples.txt
+        fi
+        e_prev=$e_now
+        sleep $sample_interval
+      done
+    ) &
+    power_pid=$!
+  fi
+  
   out="$(sysbench cpu --cpu-max-prime=20000 --threads="$threads" --time="$CPU_TIME" run 2>&1)"
+  
+  # Stop power measurement and calculate average
+  if [[ -n "$power_pid" ]]; then
+    kill "$power_pid" 2>/dev/null || true
+    wait "$power_pid" 2>/dev/null || true
+    
+    if [[ -f /tmp/proxmark-power-samples.txt ]]; then
+      POWER_LOAD_WATTS=$(awk '{ sum += $1; count++ } END { if (count > 0) printf "%.1f", sum/count; else print "0" }' /tmp/proxmark-power-samples.txt)
+      rm -f /tmp/proxmark-power-samples.txt
+      log_verbose "CPU load power: ${POWER_LOAD_WATTS}W (avg over test)"
+    fi
+  fi
   
   CPU_MULTI_EPS="$(echo "$out" | awk '/events per second/ {print $4}' || echo "0")"
   CPU_MULTI_TOTAL_TIME="$(echo "$out" | awk '/total time:/ {gsub(/s/,""); print $3}' || echo "0")"
@@ -715,6 +1417,69 @@ run_mem_benchmark() {
   MEM_READ_OPS="$(echo "$out" | awk '/Total operations:/ {print $3}' || echo "0")"
   
   log_success "Memory read: ${MEM_READ_MBS} MB/s"
+  
+  # Memory latency test (smaller block, random access pattern)
+  log "Running Memory benchmark (latency, ${MEM_TIME}s)..."
+  
+  local lat_time=$((MEM_TIME / 2))
+  [[ $lat_time -lt 5 ]] && lat_time=5
+  
+  out="$(sysbench memory \
+    --memory-block-size=64 \
+    --memory-total-size=100G \
+    --memory-oper=read \
+    --memory-access-mode=rnd \
+    --time="$lat_time" \
+    --threads=1 run 2>&1)"
+  
+  log_verbose "Sysbench latency output: $out"
+  
+  # Extract latency from sysbench output - try multiple patterns
+  local lat_avg_ms=""
+  
+  # Pattern 1: Look for "avg:" line after "Latency (ms):"
+  lat_avg_ms=$(echo "$out" | grep -A4 "Latency" | grep "avg:" | awk '{print $NF}' | head -1)
+  
+  # Pattern 2: Try awk on the whole output
+  if [[ -z "$lat_avg_ms" || "$lat_avg_ms" == "0.00" ]]; then
+    lat_avg_ms=$(echo "$out" | awk '/avg:/ {print $NF}' | head -1)
+  fi
+  
+  # Pattern 3: Calculate from throughput - sysbench shows "X MiB/sec" or "X.XX MiB transferred"
+  # Latency (ns) ≈ block_size / (throughput_bytes_per_sec)
+  if [[ -z "$lat_avg_ms" || "$lat_avg_ms" == "0.00" || "$lat_avg_ms" == "0" ]]; then
+    # Get MiB/sec from output
+    local mib_per_sec=$(echo "$out" | grep -oE '[0-9]+\.[0-9]+ MiB/sec' | awk '{print $1}' | head -1)
+    if [[ -n "$mib_per_sec" ]] && [[ "$mib_per_sec" != "0" ]]; then
+      # block_size = 64 bytes, throughput in bytes/sec = MiB/sec * 1048576
+      # time_per_op_ns = 64 / (mib_per_sec * 1048576) * 1e9
+      # time_per_op_ms = 64 / (mib_per_sec * 1048576) * 1000
+      lat_avg_ms=$(awk "BEGIN {printf \"%.6f\", 64 / ($mib_per_sec * 1048576) * 1000}")
+    fi
+  fi
+  
+  # Fallback: use total time / total operations
+  if [[ -z "$lat_avg_ms" || "$lat_avg_ms" == "0" ]]; then
+    local total_ops=$(echo "$out" | grep "Total operations:" | awk '{print $3}')
+    local total_time=$(echo "$out" | grep "total time:" | awk '{print $3}' | sed 's/s//')
+    if [[ -n "$total_ops" && -n "$total_time" && "$total_ops" != "0" ]]; then
+      lat_avg_ms=$(awk "BEGIN {if ($total_ops > 0) printf \"%.6f\", ($total_time * 1000) / $total_ops; else print \"0\"}")
+    fi
+  fi
+  
+  # Ensure we have a valid number
+  if [[ -z "$lat_avg_ms" ]] || ! [[ "$lat_avg_ms" =~ ^[0-9.]+$ ]]; then
+    lat_avg_ms="0"
+  fi
+  
+  MEM_LATENCY_MS="$lat_avg_ms"
+  if [[ "$lat_avg_ms" != "0" ]]; then
+    MEM_LATENCY_NS=$(awk "BEGIN {printf \"%.0f\", $lat_avg_ms * 1000000}")
+  else
+    MEM_LATENCY_NS="0"
+  fi
+  
+  log_success "Memory latency: ${lat_avg_ms} ms avg"
 }
 
 run_disk_benchmark() {
@@ -868,35 +1633,159 @@ run_disk_benchmark() {
   rm -f "$filename"
 }
 
+run_network_benchmark() {
+  # Only run if iperf server is specified
+  if [[ -z "$IPERF_SERVER" ]]; then
+    NET_BW_MBPS="0"
+    NET_LATENCY_MS="0"
+    SCORE_NET_BW=0
+    SCORE_NET_LATENCY=0
+    return
+  fi
+  
+  # Parse server:port
+  local server="${IPERF_SERVER%:*}"
+  local port="${IPERF_SERVER##*:}"
+  [[ "$port" == "$server" ]] && port="5201"  # Default port
+  
+  # Check if iperf3 is available
+  if ! command -v iperf3 >/dev/null 2>&1; then
+    log "Installing iperf3 for network benchmark..."
+    run_as_root apt-get install -y iperf3 >/dev/null 2>&1 || {
+      log_warning "Could not install iperf3, skipping network benchmark"
+      NET_BW_MBPS="0"
+      NET_LATENCY_MS="0"
+      SCORE_NET_BW=0
+      SCORE_NET_LATENCY=0
+      return
+    }
+  fi
+  
+  local duration=$((DISK_RUNTIME / 3))
+  [[ $duration -lt 10 ]] && duration=10
+  
+  log "Running Network benchmark (iperf3 to $server:$port, ${duration}s)..."
+  
+  # Run iperf3 test
+  local out
+  out=$(iperf3 -c "$server" -p "$port" -t "$duration" -J 2>&1) || {
+    log_warning "iperf3 failed to connect to $server:$port"
+    NET_BW_MBPS="0"
+    NET_LATENCY_MS="0"
+    SCORE_NET_BW=0
+    SCORE_NET_LATENCY=0
+    return
+  }
+  
+  # Parse results
+  if echo "$out" | jq -e '.end' >/dev/null 2>&1; then
+    # Bandwidth in Mbps
+    local bw_bps=$(echo "$out" | jq -r '.end.sum_sent.bits_per_second // 0')
+    NET_BW_MBPS=$(awk "BEGIN {printf \"%.2f\", $bw_bps / 1000000}")
+    
+    # Retransmits (as a proxy for network quality)
+    local retransmits=$(echo "$out" | jq -r '.end.sum_sent.retransmits // 0')
+    
+    log_success "Network bandwidth: ${NET_BW_MBPS} Mbps (retransmits: $retransmits)"
+    
+    # Score: 1 Mbps = 1 point
+    SCORE_NET_BW=$(awk "BEGIN {printf \"%.0f\", $NET_BW_MBPS}")
+  else
+    log_warning "Failed to parse iperf3 output"
+    NET_BW_MBPS="0"
+    SCORE_NET_BW=0
+  fi
+  
+  # Latency test (ping)
+  log "Running Network latency test..."
+  local ping_out
+  ping_out=$(ping -c 10 -q "$server" 2>&1) || true
+  NET_LATENCY_MS=$(echo "$ping_out" | awk -F'/' '/avg/ {print $5}' || echo "0")
+  
+  if [[ -n "$NET_LATENCY_MS" && "$NET_LATENCY_MS" != "0" ]]; then
+    log_success "Network latency: ${NET_LATENCY_MS} ms"
+    # Score: inverse of latency (lower latency = higher score)
+    SCORE_NET_LATENCY=$(awk "BEGIN {if ($NET_LATENCY_MS > 0) printf \"%.0f\", 10000 / $NET_LATENCY_MS; else print 0}")
+  else
+    NET_LATENCY_MS="0"
+    SCORE_NET_LATENCY=0
+  fi
+}
+
 # === Score Calculation ===
+# Proxmark Score System (larger scale like Geekbench)
+# Scores are based on performance per unit, scaled for readability
+# Higher = better
 
 calculate_scores() {
   log_verbose "Calculating scores..."
   
-  # Baselines (mid-range reference hardware)
-  local cpu_multi_baseline=10000
-  local cpu_single_baseline=1000
-  local mem_baseline=5000
-  local disk_iops_baseline=50000
-  local disk_bw_baseline=1000
+  # CPU Scores - based on events/second
+  # ~1000 e/s single-thread = 1000 points (typical modern CPU)
+  SCORE_CPU_MULTI=$(awk "BEGIN {printf \"%.0f\", ${CPU_MULTI_EPS:-0}}")
+  SCORE_CPU_SINGLE=$(awk "BEGIN {printf \"%.0f\", ${CPU_SINGLE_EPS:-0}}")
   
-  # Calculate individual scores
-  SCORE_CPU_MULTI=$(awk "BEGIN {printf \"%.0f\", (${CPU_MULTI_EPS:-0} / $cpu_multi_baseline) * 100}")
-  SCORE_CPU_SINGLE=$(awk "BEGIN {printf \"%.0f\", (${CPU_SINGLE_EPS:-0} / $cpu_single_baseline) * 100}")
-  SCORE_MEMORY=$(awk "BEGIN {printf \"%.0f\", (${MEM_WRITE_MBS:-0} / $mem_baseline) * 100}")
-  SCORE_DISK_IOPS=$(awk "BEGIN {printf \"%.0f\", (${DISK_RANDRW_IOPS_TOTAL:-0} / $disk_iops_baseline) * 100}")
-  SCORE_DISK_BW=$(awk "BEGIN {printf \"%.0f\", (${DISK_SEQ_READ_MB:-0} / $disk_bw_baseline) * 100}")
+  # Memory Scores - based on MB/s
+  # Scaled: 1 MB/s = 1 point
+  SCORE_MEM_WRITE=$(awk "BEGIN {printf \"%.0f\", ${MEM_WRITE_MBS:-0}}")
+  SCORE_MEM_READ=$(awk "BEGIN {printf \"%.0f\", ${MEM_READ_MBS:-0}}")
   
-  # Composite score (weighted)
-  # CPU: 25%, Memory: 15%, Disk: 60%
+  # Memory Latency Score (if available) - inverse, lower is better
+  # Note: Our latency measurement is throughput-derived, not true latency
+  # Scale it to be comparable with other scores (cap at 10000)
+  if [[ -n "${MEM_LATENCY_NS:-}" ]] && [[ "${MEM_LATENCY_NS:-0}" -gt 0 ]]; then
+    # Lower latency = higher score, but cap to prevent dominance
+    local raw_lat_score=$(awk "BEGIN {printf \"%.0f\", 100000 / ${MEM_LATENCY_NS}}")
+    # Cap at 10000 to keep it proportional to other memory scores
+    if [[ "$raw_lat_score" -gt 10000 ]]; then
+      SCORE_MEM_LATENCY=10000
+    else
+      SCORE_MEM_LATENCY="$raw_lat_score"
+    fi
+  else
+    SCORE_MEM_LATENCY=0
+  fi
+  
+  # Disk Scores
+  # IOPS: 1 IOPS = 1 point (4K random is typically 10K-500K)
+  SCORE_DISK_RAND_IOPS=$(awk "BEGIN {printf \"%.0f\", ${DISK_RANDRW_IOPS_TOTAL:-0}}")
+  SCORE_DISK_SEQ_READ_IOPS=$(awk "BEGIN {printf \"%.0f\", ${DISK_SEQ_READ_IOPS:-0}}")
+  SCORE_DISK_SEQ_WRITE_IOPS=$(awk "BEGIN {printf \"%.0f\", ${DISK_SEQ_WRITE_IOPS:-0}}")
+  
+  # Bandwidth: 1 MB/s = 10 points (makes sequential scores comparable to IOPS)
+  SCORE_DISK_RAND_BW=$(awk "BEGIN {printf \"%.0f\", (${DISK_RANDRW_BW_R_MB:-0} + ${DISK_RANDRW_BW_W_MB:-0}) * 10}")
+  SCORE_DISK_SEQ_READ_BW=$(awk "BEGIN {printf \"%.0f\", ${DISK_SEQ_READ_MB:-0} * 10}")
+  SCORE_DISK_SEQ_WRITE_BW=$(awk "BEGIN {printf \"%.0f\", ${DISK_SEQ_WRITE_MB:-0} * 10}")
+  
+  # Disk Latency Score (if available) - inverse, lower is better
+  if [[ -n "${DISK_RANDRW_LAT_AVG_US:-}" ]] && [[ "${DISK_RANDRW_LAT_AVG_US:-0}" -gt 0 ]]; then
+    SCORE_DISK_LATENCY=$(awk "BEGIN {printf \"%.0f\", 1000000 / ${DISK_RANDRW_LAT_AVG_US}}")
+  else
+    SCORE_DISK_LATENCY=0
+  fi
+  
+  # Network Scores (if iperf was run)
+  SCORE_NET_BW=${SCORE_NET_BW:-0}
+  SCORE_NET_LATENCY=${SCORE_NET_LATENCY:-0}
+  
+  # Category Subtotals
+  SCORE_CPU_TOTAL=$(awk "BEGIN {printf \"%.0f\", ($SCORE_CPU_MULTI + $SCORE_CPU_SINGLE)}")
+  SCORE_MEM_TOTAL=$(awk "BEGIN {printf \"%.0f\", ($SCORE_MEM_WRITE + $SCORE_MEM_READ) / 100 + $SCORE_MEM_LATENCY}")
+  SCORE_DISK_TOTAL=$(awk "BEGIN {printf \"%.0f\", $SCORE_DISK_RAND_IOPS + ($SCORE_DISK_SEQ_READ_BW + $SCORE_DISK_SEQ_WRITE_BW) / 10}")
+  
+  # Total Score (weighted for Proxmox workloads)
+  # CPU: 20%, Memory: 20%, Disk: 60%
   SCORE_TOTAL=$(awk "BEGIN {
-    cpu_score = ($SCORE_CPU_MULTI + $SCORE_CPU_SINGLE) / 2
-    disk_score = ($SCORE_DISK_IOPS + $SCORE_DISK_BW) / 2
-    total = (cpu_score * 0.25) + ($SCORE_MEMORY * 0.15) + (disk_score * 0.60)
-    printf \"%.0f\", total * 10
+    cpu = ($SCORE_CPU_MULTI + $SCORE_CPU_SINGLE)
+    mem = ($SCORE_MEM_WRITE + $SCORE_MEM_READ) / 100
+    disk = $SCORE_DISK_RAND_IOPS + ($SCORE_DISK_SEQ_READ_BW + $SCORE_DISK_SEQ_WRITE_BW) / 20
+    total = (cpu * 0.20) + (mem * 0.20) + (disk * 0.60)
+    printf \"%.0f\", total
   }")
   
-  log_verbose "Scores - CPU: $SCORE_CPU_MULTI/$SCORE_CPU_SINGLE, Mem: $SCORE_MEMORY, Disk: $SCORE_DISK_IOPS/$SCORE_DISK_BW, Total: $SCORE_TOTAL"
+  log_verbose "Scores - CPU: $SCORE_CPU_MULTI/$SCORE_CPU_SINGLE, Mem: $SCORE_MEM_WRITE/$SCORE_MEM_READ"
+  log_verbose "Scores - Disk IOPS: $SCORE_DISK_RAND_IOPS, BW: $SCORE_DISK_SEQ_READ_BW/$SCORE_DISK_SEQ_WRITE_BW"
+  log_verbose "Total Score: $SCORE_TOTAL"
 }
 
 # === Output Generation ===
@@ -926,6 +1815,7 @@ generate_json() {
     --arg mem_write_ops "${MEM_WRITE_OPS:-0}" \
     --arg mem_read_mbs "${MEM_READ_MBS:-0}" \
     --arg mem_read_ops "${MEM_READ_OPS:-0}" \
+    --arg mem_latency_ms "${MEM_LATENCY_MS:-0}" \
     --argjson disk_randrw_iops_r "${DISK_RANDRW_IOPS_R:-0}" \
     --argjson disk_randrw_iops_w "${DISK_RANDRW_IOPS_W:-0}" \
     --argjson disk_randrw_iops_total "${DISK_RANDRW_IOPS_TOTAL:-0}" \
@@ -938,10 +1828,20 @@ generate_json() {
     --arg disk_seq_write_mb "${DISK_SEQ_WRITE_MB:-0}" \
     --argjson score_cpu_multi "${SCORE_CPU_MULTI:-0}" \
     --argjson score_cpu_single "${SCORE_CPU_SINGLE:-0}" \
-    --argjson score_memory "${SCORE_MEMORY:-0}" \
-    --argjson score_disk_iops "${SCORE_DISK_IOPS:-0}" \
-    --argjson score_disk_bw "${SCORE_DISK_BW:-0}" \
+    --argjson score_mem_write "${SCORE_MEM_WRITE:-0}" \
+    --argjson score_mem_read "${SCORE_MEM_READ:-0}" \
+    --argjson score_mem_latency "${SCORE_MEM_LATENCY:-0}" \
+    --argjson score_disk_rand_iops "${SCORE_DISK_RAND_IOPS:-0}" \
+    --argjson score_disk_seq_read "${SCORE_DISK_SEQ_READ_BW:-0}" \
+    --argjson score_disk_seq_write "${SCORE_DISK_SEQ_WRITE_BW:-0}" \
+    --argjson score_cpu_total "${SCORE_CPU_TOTAL:-0}" \
+    --argjson score_mem_total "${SCORE_MEM_TOTAL:-0}" \
+    --argjson score_disk_total "${SCORE_DISK_TOTAL:-0}" \
     --argjson score_total "${SCORE_TOTAL:-0}" \
+    --arg net_bw_mbps "${NET_BW_MBPS:-0}" \
+    --arg net_latency_ms "${NET_LATENCY_MS:-0}" \
+    --argjson score_net_bw "${SCORE_NET_BW:-0}" \
+    --argjson score_net_latency "${SCORE_NET_LATENCY:-0}" \
     --argjson tags "$tags_json" \
     --arg notes "$NOTES" \
     '{
@@ -979,7 +1879,8 @@ generate_json() {
           read: {
             mb_per_sec: ($mem_read_mbs | tonumber),
             total_ops: ($mem_read_ops | tonumber)
-          }
+          },
+          latency_ms: ($mem_latency_ms | tonumber)
         },
         disk: {
           randrw: {
@@ -998,15 +1899,35 @@ generate_json() {
             iops: $disk_seq_write_iops,
             bw_mb: ($disk_seq_write_mb | tonumber)
           }
+        },
+        network: {
+          bandwidth_mbps: ($net_bw_mbps | tonumber),
+          latency_ms: ($net_latency_ms | tonumber)
         }
       },
       scores: {
-        cpu_multi: $score_cpu_multi,
-        cpu_single: $score_cpu_single,
-        memory: $score_memory,
-        disk_iops: $score_disk_iops,
-        disk_bw: $score_disk_bw,
-        total: $score_total
+        cpu: {
+          multi_thread: $score_cpu_multi,
+          single_thread: $score_cpu_single,
+          total: $score_cpu_total
+        },
+        memory: {
+          write: $score_mem_write,
+          read: $score_mem_read,
+          latency: $score_mem_latency,
+          total: $score_mem_total
+        },
+        disk: {
+          random_iops: $score_disk_rand_iops,
+          seq_read: $score_disk_seq_read,
+          seq_write: $score_disk_seq_write,
+          total: $score_disk_total
+        },
+        network: {
+          bandwidth: $score_net_bw,
+          latency: $score_net_latency
+        },
+        proxmark_score: $score_total
       },
       tags: $tags,
       notes: $notes
@@ -1038,20 +1959,73 @@ print_summary() {
   echo -e "  ${BOLD}Hostname:${NC}     $HOSTNAME"
   echo -e "  ${BOLD}OS:${NC}           $OS"
   echo -e "  ${BOLD}Kernel:${NC}       $KERNEL"
-  [[ -n "$PROXMOX_VERSION" ]] && echo -e "  ${BOLD}Proxmox:${NC}      $PROXMOX_VERSION"
+  if [[ -n "$PROXMOX_VERSION" ]]; then
+    echo -e "  ${BOLD}Proxmox:${NC}      $PROXMOX_VERSION"
+    if [[ -n "$PVE_CLUSTER_NAME" ]]; then
+      echo -e "  ${BOLD}Cluster:${NC}      $PVE_CLUSTER_NAME ($PVE_CLUSTER_NODES nodes)"
+    fi
+    if [[ $PVE_VM_COUNT -gt 0 ]] || [[ $PVE_CT_COUNT -gt 0 ]]; then
+      echo -e "  ${BOLD}Workloads:${NC}    $PVE_VM_COUNT VMs, $PVE_CT_COUNT containers"
+    fi
+    if [[ -n "$PVE_STORAGE_INFO" ]]; then
+      echo -e "  ${BOLD}Storage:${NC}      $PVE_STORAGE_INFO"
+    fi
+  fi
   echo
   
   # CPU info section
   echo -e "${BOLD}${YELLOW}CPU${NC}"
   echo -e "${DIM}────────────────────────────────────────────────────────────────────────────${NC}"
   echo -e "  ${BOLD}Model:${NC}        $CPU_MODEL"
+  [[ -n "$CPU_VENDOR" ]] && echo -e "  ${BOLD}Vendor:${NC}       $CPU_VENDOR"
   echo -e "  ${BOLD}Cores:${NC}        $CPU_CORES cores / $CPU_THREADS threads"
   echo -e "  ${BOLD}Sockets:${NC}      $CPU_SOCKETS"
-  if [[ -n "$CPU_FREQ_BASE_MHZ" && "$CPU_FREQ_BASE_MHZ" != "0" ]]; then
+  [[ -n "$CPU_SOCKET" ]] && echo -e "  ${BOLD}Socket:${NC}       $CPU_SOCKET"
+  [[ -n "$CPU_ARCH" ]] && echo -e "  ${BOLD}Architecture:${NC} $CPU_ARCH"
+  
+  # Frequency info - show base and max on same line if both available
+  if [[ -n "$CPU_FREQ_BASE_MHZ" && "$CPU_FREQ_BASE_MHZ" != "0" ]] && [[ -n "$CPU_FREQ_MAX_MHZ" && "$CPU_FREQ_MAX_MHZ" != "0" ]]; then
+    echo -e "  ${BOLD}Frequency:${NC}    ${CPU_FREQ_BASE_MHZ} MHz base / ${CPU_FREQ_MAX_MHZ} MHz boost"
+  elif [[ -n "$CPU_FREQ_BASE_MHZ" && "$CPU_FREQ_BASE_MHZ" != "0" ]]; then
     echo -e "  ${BOLD}Base Freq:${NC}    ${CPU_FREQ_BASE_MHZ} MHz"
-  fi
-  if [[ -n "$CPU_FREQ_MAX_MHZ" && "$CPU_FREQ_MAX_MHZ" != "0" ]]; then
+  elif [[ -n "$CPU_FREQ_MAX_MHZ" && "$CPU_FREQ_MAX_MHZ" != "0" ]]; then
     echo -e "  ${BOLD}Max Freq:${NC}     ${CPU_FREQ_MAX_MHZ} MHz"
+  fi
+  
+  # Power information - sanity check: idle should be less than load
+  local show_idle="${POWER_IDLE_WATTS:-0}"
+  local show_load="${POWER_LOAD_WATTS:-0}"
+  
+  # If idle >= load, readings are unreliable - only show if load > idle
+  if [[ -n "$show_idle" && -n "$show_load" ]] && \
+     [[ "$(awk "BEGIN {print ($show_idle >= $show_load)}")" == "1" ]]; then
+    # Readings don't make sense, only show TDP if available
+    if [[ -n "$CPU_TDP_WATTS" && "$CPU_TDP_WATTS" != "0" ]]; then
+      echo -e "  ${BOLD}Power:${NC}        TDP: ${CPU_TDP_WATTS}W"
+    fi
+  elif [[ -n "$show_idle" && "$show_idle" != "0" ]] || [[ -n "$show_load" && "$show_load" != "0" ]]; then
+    local power_info=""
+    if [[ -n "$CPU_TDP_WATTS" && "$CPU_TDP_WATTS" != "0" ]]; then
+      power_info="TDP: ${CPU_TDP_WATTS}W"
+    fi
+    if [[ -n "$show_idle" && "$show_idle" != "0" ]]; then
+      [[ -n "$power_info" ]] && power_info+=", "
+      power_info+="Idle: ${show_idle}W"
+    fi
+    if [[ -n "$show_load" && "$show_load" != "0" ]]; then
+      [[ -n "$power_info" ]] && power_info+=", "
+      power_info+="Load: ${show_load}W"
+    fi
+    echo -e "  ${BOLD}Power:${NC}        $power_info"
+  fi
+  
+  # Cache info
+  if [[ -n "$CPU_CACHE_L1" || -n "$CPU_CACHE_L2" || -n "$CPU_CACHE_L3" ]]; then
+    local cache_info=""
+    [[ -n "$CPU_CACHE_L1" ]] && cache_info+="L1: $CPU_CACHE_L1"
+    [[ -n "$CPU_CACHE_L2" ]] && cache_info+="${cache_info:+, }L2: $CPU_CACHE_L2"
+    [[ -n "$CPU_CACHE_L3" ]] && cache_info+="${cache_info:+, }L3: $CPU_CACHE_L3"
+    echo -e "  ${BOLD}Cache:${NC}        $cache_info"
   fi
   echo
   
@@ -1060,8 +2034,28 @@ print_summary() {
   echo -e "${BOLD}${YELLOW}MEMORY${NC}"
   echo -e "${DIM}────────────────────────────────────────────────────────────────────────────${NC}"
   echo -e "  ${BOLD}Total:${NC}        ${mem_gb} GB (${MEM_TOTAL_MB} MB)"
-  [[ "$MEM_TYPE" != "unknown" && -n "$MEM_TYPE" ]] && echo -e "  ${BOLD}Type:${NC}         $MEM_TYPE"
+  if [[ "$MEM_TYPE" != "unknown" && -n "$MEM_TYPE" ]]; then
+    local mem_type_display="$MEM_TYPE"
+    [[ -n "$MEM_FORM_FACTOR" ]] && mem_type_display="$MEM_FORM_FACTOR $MEM_TYPE"
+    [[ -n "$MEM_ECC" ]] && mem_type_display="$mem_type_display $MEM_ECC"
+    echo -e "  ${BOLD}Type:${NC}         $mem_type_display"
+  fi
   [[ -n "$MEM_SPEED" ]] && echo -e "  ${BOLD}Speed:${NC}        $MEM_SPEED"
+  [[ -n "$MEM_CHANNELS" ]] && echo -e "  ${BOLD}Config:${NC}       $MEM_CHANNELS (${MEM_SLOTS_USED}/${MEM_SLOTS_TOTAL} slots)"
+  
+  # Show per-bank details if available
+  if [[ ${#MEM_BANKS[@]} -gt 0 ]]; then
+    echo -e "  ${BOLD}Banks:${NC}"
+    for bank_info in "${MEM_BANKS[@]}"; do
+      IFS='|' read -r slot size vendor product clock <<< "$bank_info"
+      local bank_detail="    ${slot}: ${size}"
+      [[ -n "$vendor" && "$vendor" != "Unknown" ]] && bank_detail+=" ($vendor"
+      [[ -n "$product" && "$product" != "Unknown" ]] && bank_detail+=" $product"
+      [[ -n "$vendor" && "$vendor" != "Unknown" ]] && bank_detail+=")"
+      [[ -n "$clock" ]] && bank_detail+=" @ ${clock}"
+      echo -e "$bank_detail"
+    done
+  fi
   echo
   
   # Disk info section
@@ -1085,31 +2079,140 @@ print_summary() {
   # Calculate combined MB/s for random r/w
   local randrw_total_mb=$(awk "BEGIN {printf \"%.2f\", ${DISK_RANDRW_BW_R_MB:-0} + ${DISK_RANDRW_BW_W_MB:-0}}")
   
-  echo -e "${DIM}┌────────────┬─────────────────────┬──────────────┬──────────────┬─────────┐${NC}"
-  echo -e "${DIM}│${NC}${BOLD} Component  ${DIM}│${NC}${BOLD} Test                ${DIM}│${NC}${BOLD} IOPS         ${DIM}│${NC}${BOLD} Throughput   ${DIM}│${NC}${BOLD} Score   ${DIM}│${NC}"
-  echo -e "${DIM}├────────────┼─────────────────────┼──────────────┼──────────────┼─────────┤${NC}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "CPU" "Multi-thread" "${CPU_MULTI_EPS} e/s" "${SCORE_CPU_MULTI}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "CPU" "Single-thread" "${CPU_SINGLE_EPS} e/s" "${SCORE_CPU_SINGLE}"
-  echo -e "${DIM}├────────────┼─────────────────────┼──────────────┼──────────────┼─────────┤${NC}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "Memory" "Write" "${MEM_WRITE_MBS} MB/s" "${SCORE_MEMORY}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC}              ${DIM}│${NC} %10s   ${DIM}│${NC}         ${DIM}│${NC}\n" "Memory" "Read" "${MEM_READ_MBS} MB/s"
-  echo -e "${DIM}├────────────┼─────────────────────┼──────────────┼──────────────┼─────────┤${NC}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC} %12s ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "Disk" "4K Random R/W" "${DISK_RANDRW_IOPS_TOTAL}" "${randrw_total_mb} MB/s" "${SCORE_DISK_IOPS}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC} %12s ${DIM}│${NC} %10s   ${DIM}│${NC} ${GREEN}%7s${NC} ${DIM}│${NC}\n" "Disk" "Sequential Read" "${DISK_SEQ_READ_IOPS:-0}" "${DISK_SEQ_READ_MB} MB/s" "${SCORE_DISK_BW}"
-  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-19s ${DIM}│${NC} %12s ${DIM}│${NC} %10s   ${DIM}│${NC}         ${DIM}│${NC}\n" "Disk" "Sequential Write" "${DISK_SEQ_WRITE_IOPS:-0}" "${DISK_SEQ_WRITE_MB} MB/s"
-  echo -e "${DIM}└────────────┴─────────────────────┴──────────────┴──────────────┴─────────┘${NC}"
+  # Format throughput values to fit in column (truncate decimals if needed)
+  local cpu_multi_tput=$(printf "%.0f e/s" "${CPU_MULTI_EPS}")
+  local cpu_single_tput=$(printf "%.0f e/s" "${CPU_SINGLE_EPS}")
+  local mem_write_tput=$(printf "%.0f MB/s" "${MEM_WRITE_MBS}")
+  local mem_read_tput=$(printf "%.0f MB/s" "${MEM_READ_MBS}")
+  local mem_lat_tput=$(printf "%.4f ms" "${MEM_LATENCY_MS:-0}")
+  local disk_rand_tput=$(printf "%.0f MB/s" "${randrw_total_mb}")
+  local disk_seqr_tput=$(printf "%.0f MB/s" "${DISK_SEQ_READ_MB}")
+  local disk_seqw_tput=$(printf "%.0f MB/s" "${DISK_SEQ_WRITE_MB}")
+  
+  echo -e "${DIM}┌────────────┬───────────────────┬──────────────┬────────────────┬──────────┐${NC}"
+  echo -e "${DIM}│${NC}${BOLD} Component  ${DIM}│${NC}${BOLD} Test              ${DIM}│${NC}${BOLD} IOPS         ${DIM}│${NC}${BOLD} Throughput     ${DIM}│${NC}${BOLD} Score    ${DIM}│${NC}"
+  echo -e "${DIM}├────────────┼───────────────────┼──────────────┼────────────────┼──────────┤${NC}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-17s ${DIM}│${NC} %12s ${DIM}│${NC} %14s ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "CPU" "Multi-thread" "-" "$cpu_multi_tput" "${SCORE_CPU_MULTI}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-17s ${DIM}│${NC} %12s ${DIM}│${NC} %14s ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "CPU" "Single-thread" "-" "$cpu_single_tput" "${SCORE_CPU_SINGLE}"
+  echo -e "${DIM}├────────────┼───────────────────┼──────────────┼────────────────┼──────────┤${NC}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-17s ${DIM}│${NC} %12s ${DIM}│${NC} %14s ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Memory" "Write" "-" "$mem_write_tput" "${SCORE_MEM_WRITE}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-17s ${DIM}│${NC} %12s ${DIM}│${NC} %14s ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Memory" "Read" "-" "$mem_read_tput" "${SCORE_MEM_READ}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-17s ${DIM}│${NC} %12s ${DIM}│${NC} %14s ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Memory" "Latency" "-" "$mem_lat_tput" "${SCORE_MEM_LATENCY}"
+  echo -e "${DIM}├────────────┼───────────────────┼──────────────┼────────────────┼──────────┤${NC}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-17s ${DIM}│${NC} %12s ${DIM}│${NC} %14s ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Disk" "4K Random R/W" "${DISK_RANDRW_IOPS_TOTAL}" "$disk_rand_tput" "${SCORE_DISK_RAND_IOPS}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-17s ${DIM}│${NC} %12s ${DIM}│${NC} %14s ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Disk" "Seq Read" "${DISK_SEQ_READ_IOPS:-0}" "$disk_seqr_tput" "${SCORE_DISK_SEQ_READ_BW}"
+  printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-17s ${DIM}│${NC} %12s ${DIM}│${NC} %14s ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Disk" "Seq Write" "${DISK_SEQ_WRITE_IOPS:-0}" "$disk_seqw_tput" "${SCORE_DISK_SEQ_WRITE_BW}"
+  
+  # Network section (only if iperf was run)
+  if [[ -n "$IPERF_SERVER" ]] && [[ "${NET_BW_MBPS:-0}" != "0" ]]; then
+    echo -e "${DIM}├────────────┼───────────────────┼──────────────┼────────────────┼──────────┤${NC}"
+    printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-17s ${DIM}│${NC} %12s ${DIM}│${NC} %14s ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Network" "Bandwidth" "-" "${NET_BW_MBPS} Mbps" "${SCORE_NET_BW}"
+    printf "${DIM}│${NC} %-10s ${DIM}│${NC} %-17s ${DIM}│${NC} %12s ${DIM}│${NC} %14s ${DIM}│${NC} ${GREEN}%8s${NC} ${DIM}│${NC}\n" "Network" "Latency" "-" "${NET_LATENCY_MS} ms" "${SCORE_NET_LATENCY}"
+  fi
+  
+  echo -e "${DIM}└────────────┴───────────────────┴──────────────┴────────────────┴──────────┘${NC}"
+  echo
+  
+  # Category subtotals
+  echo -e "${DIM}Category Scores: CPU: ${SCORE_CPU_TOTAL:-0} | Memory: ${SCORE_MEM_TOTAL:-0} | Disk: ${SCORE_DISK_TOTAL:-0}${NC}"
   echo
   
   # Total score - make it stand out
   echo -e "${CYAN}╭──────────────────────────────────────────────────────────────────────────╮${NC}"
-  printf "${CYAN}│${NC}                           ${BOLD}TOTAL SCORE: ${GREEN}%-6s${NC}                           ${CYAN}│${NC}\n" "${SCORE_TOTAL}"
+  printf "${CYAN}│${NC}                         ${BOLD}PROXMARK SCORE: ${GREEN}%-8s${NC}                        ${CYAN}│${NC}\n" "${SCORE_TOTAL}"
   echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────────────╯${NC}"
   echo
   
   # File paths
   echo -e "${DIM}📁 JSON saved:${NC} $RESULT_JSON"
+  echo -e "${DIM}📋 Log file:${NC} $LOG_FILE"
+  if [[ "$DEBUG" == "true" ]]; then
+    echo -e "${DIM}🔍 Debug file:${NC} $DEBUG_FILE"
+  fi
   echo -e "${DIM}🌐 Result URL:${NC} ${YELLOW}(coming soon - proxmark.io)${NC}"
   echo
+  
+  # Write summary to log file for later reference
+  write_summary_to_log
+}
+
+write_summary_to_log() {
+  local randrw_total_mb=$(awk "BEGIN {printf \"%.2f\", ${DISK_RANDRW_BW_R_MB:-0} + ${DISK_RANDRW_BW_W_MB:-0}}")
+  
+  local randrw_total_mb=$(awk "BEGIN {printf \"%.2f\", ${DISK_RANDRW_BW_R_MB:-0} + ${DISK_RANDRW_BW_W_MB:-0}}")
+  
+  {
+    echo ""
+    echo "=========================================="
+    echo "BENCHMARK RESULTS SUMMARY"
+    echo "=========================================="
+    echo ""
+    echo "SYSTEM INFORMATION"
+    echo "----------------------------------------"
+    echo "  Hostname:     $HOSTNAME"
+    echo "  OS:           $OS"
+    echo "  Kernel:       $KERNEL"
+    if [[ -n "$PROXMOX_VERSION" ]]; then
+      echo "  Proxmox:      $PROXMOX_VERSION"
+      [[ -n "$PVE_CLUSTER_NAME" ]] && echo "  Cluster:      $PVE_CLUSTER_NAME ($PVE_CLUSTER_NODES nodes)"
+      [[ $PVE_VM_COUNT -gt 0 || $PVE_CT_COUNT -gt 0 ]] && echo "  Workloads:    $PVE_VM_COUNT VMs, $PVE_CT_COUNT containers"
+      [[ -n "$PVE_STORAGE_INFO" ]] && echo "  Storage:      $PVE_STORAGE_INFO"
+    fi
+    echo ""
+    echo "CPU"
+    echo "----------------------------------------"
+    echo "  Model:        $CPU_MODEL"
+    echo "  Cores:        $CPU_CORES cores / $CPU_THREADS threads"
+    echo "  Sockets:      $CPU_SOCKETS"
+    [[ -n "$CPU_FREQ_BASE_MHZ" && "$CPU_FREQ_BASE_MHZ" != "0" ]] && echo "  Base Freq:    ${CPU_FREQ_BASE_MHZ} MHz"
+    [[ -n "$CPU_FREQ_MAX_MHZ" && "$CPU_FREQ_MAX_MHZ" != "0" ]] && echo "  Max Freq:     ${CPU_FREQ_MAX_MHZ} MHz"
+    echo ""
+    echo "MEMORY"
+    echo "----------------------------------------"
+    echo "  Total:        $((MEM_TOTAL_MB / 1024)) GB (${MEM_TOTAL_MB} MB)"
+    if [[ "$MEM_TYPE" != "unknown" && -n "$MEM_TYPE" ]]; then
+      local log_mem_type="$MEM_TYPE"
+      [[ -n "$MEM_ECC" ]] && log_mem_type="$MEM_TYPE $MEM_ECC"
+      echo "  Type:         $log_mem_type"
+    fi
+    [[ -n "$MEM_SPEED" ]] && echo "  Speed:        $MEM_SPEED"
+    [[ -n "$MEM_CHANNELS" ]] && echo "  Config:       $MEM_CHANNELS (${MEM_SLOTS_USED}/${MEM_SLOTS_TOTAL} slots)"
+    echo ""
+    echo "STORAGE"
+    echo "----------------------------------------"
+    echo "  Test Path:    $DISK_PATH"
+    echo "  Device:       $ROOT_DEV"
+    [[ -n "$DISK_MODEL" ]] && echo "  Model:        $DISK_MODEL"
+    echo "  Type:         ${DISK_TYPE^^}"
+    [[ $DISK_SIZE_GB -gt 0 ]] && echo "  Size:         ${DISK_SIZE_GB} GB"
+    echo ""
+    echo "BENCHMARK RESULTS"
+    echo "----------------------------------------"
+    printf "  %-22s %12s %12s %8s\n" "Test" "IOPS" "Throughput" "Score"
+    echo "  ----------------------------------------------------------------"
+    printf "  %-22s %12s %12s %8s\n" "CPU Multi-thread" "-" "${CPU_MULTI_EPS} e/s" "$SCORE_CPU_MULTI"
+    printf "  %-22s %12s %12s %8s\n" "CPU Single-thread" "-" "${CPU_SINGLE_EPS} e/s" "$SCORE_CPU_SINGLE"
+    printf "  %-22s %12s %12s %8s\n" "Memory Write" "-" "${MEM_WRITE_MBS} MB/s" "$SCORE_MEM_WRITE"
+    printf "  %-22s %12s %12s %8s\n" "Memory Read" "-" "${MEM_READ_MBS} MB/s" "$SCORE_MEM_READ"
+    printf "  %-22s %12s %12s %8s\n" "Memory Latency" "-" "${MEM_LATENCY_MS:-0} ms" "$SCORE_MEM_LATENCY"
+    printf "  %-22s %12s %12s %8s\n" "Disk 4K Random R/W" "$DISK_RANDRW_IOPS_TOTAL" "${randrw_total_mb} MB/s" "$SCORE_DISK_RAND_IOPS"
+    printf "  %-22s %12s %12s %8s\n" "Disk Seq Read" "${DISK_SEQ_READ_IOPS:-0}" "${DISK_SEQ_READ_MB} MB/s" "$SCORE_DISK_SEQ_READ_BW"
+    printf "  %-22s %12s %12s %8s\n" "Disk Seq Write" "${DISK_SEQ_WRITE_IOPS:-0}" "${DISK_SEQ_WRITE_MB} MB/s" "$SCORE_DISK_SEQ_WRITE_BW"
+    if [[ -n "$IPERF_SERVER" ]] && [[ "${NET_BW_MBPS:-0}" != "0" ]]; then
+      printf "  %-22s %12s %12s %8s\n" "Network Bandwidth" "-" "${NET_BW_MBPS} Mbps" "$SCORE_NET_BW"
+      printf "  %-22s %12s %12s %8s\n" "Network Latency" "-" "${NET_LATENCY_MS} ms" "$SCORE_NET_LATENCY"
+    fi
+    echo ""
+    echo "Category Scores: CPU: ${SCORE_CPU_TOTAL:-0} | Memory: ${SCORE_MEM_TOTAL:-0} | Disk: ${SCORE_DISK_TOTAL:-0}"
+    echo ""
+    echo "=========================================="
+    echo "PROXMARK SCORE: $SCORE_TOTAL"
+    echo "=========================================="
+    echo ""
+    echo "JSON saved: $RESULT_JSON"
+    echo "Log file:   $LOG_FILE"
+    echo ""
+  } >> "$LOG_FILE" 2>/dev/null || true
 }
 
 upload_results() {
@@ -1135,6 +2238,54 @@ upload_results() {
 
 # === Main ===
 
+init_logging() {
+  # Initialize log file with header
+  {
+    echo "=========================================="
+    echo "Proxmark v$VERSION - Benchmark Log"
+    echo "Started: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "Run ID: $RUN_UUID"
+    echo "=========================================="
+  } > "$LOG_FILE" 2>/dev/null || true
+  
+  # Initialize debug file if in debug mode
+  if [[ "$DEBUG" == "true" ]]; then
+    {
+      echo "=========================================="
+      echo "Proxmark v$VERSION - Debug Log"
+      echo "Started: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "Run ID: $RUN_UUID"
+      echo "=========================================="
+      echo ""
+      echo "=== System Information ==="
+      echo "Hostname: $(hostname)"
+      echo "Kernel: $(uname -r)"
+      echo "OS: $(cat /etc/os-release 2>/dev/null | head -5)"
+      echo ""
+      echo "=== CPU Info ==="
+      head -30 /proc/cpuinfo 2>/dev/null || true
+      echo ""
+      echo "=== Memory Info ==="
+      cat /proc/meminfo 2>/dev/null | head -20 || true
+      echo ""
+      echo "=== Block Devices ==="
+      lsblk 2>/dev/null || true
+      echo ""
+      echo "=== Disk Free ==="
+      df -h 2>/dev/null || true
+      echo ""
+      echo "=== Mount Points ==="
+      mount 2>/dev/null | grep -E '^/dev' || true
+      echo ""
+      echo "=== DMI Memory ==="
+      dmidecode -t memory 2>/dev/null | head -50 || echo "(dmidecode not available or no permission)"
+      echo ""
+      echo "=========================================="
+      echo ""
+    } > "$DEBUG_FILE" 2>/dev/null || true
+  fi
+}
+
 main() {
   parse_args "$@"
   
@@ -1148,25 +2299,58 @@ main() {
     exit 0
   fi
   
+  # Initialize logging first
+  init_logging
+  
   print_banner
   debug_system_info
   
   check_dependencies
   collect_sysinfo
   
+  # Discover available storage paths
+  discover_storage_paths
+  
   run_cpu_benchmark
   run_mem_benchmark
   run_disk_benchmark
+  run_network_benchmark
   
   calculate_scores
   generate_json
   
   print_summary
+  
+  # Prompt for additional disks if available and interactive
+  if [[ "$ALL_DISKS" == "true" ]]; then
+    # Benchmark all discovered storage
+    for path in "${DISCOVERED_STORAGE[@]:1}"; do
+      echo
+      log "Benchmarking additional storage: $path"
+      DISK_PATH="$path"
+      run_disk_benchmark
+    done
+  else
+    prompt_additional_disks
+    
+    # Benchmark additional paths if user selected any
+    if [[ ${#ADDITIONAL_DISK_PATHS[@]} -gt 0 ]]; then
+      for path in "${ADDITIONAL_DISK_PATHS[@]}"; do
+        echo
+        log "Benchmarking additional storage: $path"
+        DISK_PATH="$path"
+        run_disk_benchmark
+        # TODO: Store results per disk
+      done
+    fi
+  fi
+  
   upload_results
   
   log_success "Benchmark complete!"
 }
 
 main "$@"
+
 
 
